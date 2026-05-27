@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('pipeline.py'\\).read\\(\\)\\); print\\('pipeline.py OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(.venvScriptspython.exe -c ' *)",
+      "PowerShell(Invoke-WebRequest -Uri \"http://127.0.0.1:8000/api/options\" -UseBasicParsing -TimeoutSec 5 | Select-Object -ExpandProperty Content | ConvertFrom-Json | Select-Object -Property @{n=\"seasons_count\";e={$_.seasons.Count}}, @{n=\"teams_count\";e={$_.teams.Count}}, @{n=\"venues_count\";e={$_.venues.Count}})",
+      "Bash(python -m uvicorn app:app --port 8000 --reload)",
+      "Bash(curl -s http://localhost:8000/api/options)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'Teams: {len\\(d[\\\\\"teams\\\\\"]\\)}, Venues: {len\\(d[\\\\\"venues\\\\\"]\\)}, Seasons: {len\\(d[\\\\\"seasons\\\\\"]\\)}'\\)\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/api/records)",
+      "Bash(curl -s http://localhost:8000/openapi.json)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); paths=[p for p in d['paths'] if 'record' in p or 'season' in p]; print\\('Registered paths:', paths\\)\")",
+      "Bash(taskkill /F /IM python.exe)",
+      "PowerShell(Get-Process python -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force -Confirm:$false)",
+      "PowerShell($s = Invoke-RestMethod \"http://localhost:8000/api/seasons\"; Write-Host \"Seasons: $\\($s.seasons.Count\\)\"; $s.seasons | Select-Object -First 5 | ForEach-Object { Write-Host \"$\\($_.season\\): $\\($_.matches\\) matches, Top: $\\($_.top_scorer\\) \\($\\($_.top_scorer_runs\\) runs\\)\" })",
+      "PowerShell(cd \"c:\\\\Users\\\\jayas\\\\Downloads\\\\IPL_Dashboard\\\\IPL_Dashboard\"; node --input-type=module --eval \\(Get-Content static\\\\app.js -Raw\\) 2>&1 | Select-Object -First 5)"
+    ]
+  }
+}
