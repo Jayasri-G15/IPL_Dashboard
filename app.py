@@ -1,641 +1,724 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from functools import lru_cache
+import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, cast
+from zipfile import BadZipFile, ZipFile
 
 import pandas as pd
-from fastapi import FastAPI, Query
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
-from pipeline import (
-    PipelineResult,
-    build_batting_summary,
-    build_bowling_summary,
-    build_match_metrics,
-    build_team_results,
-    build_toss_summary,
-    build_venue_summary,
-    load_cricsheet_archive,
-)
+CRICHEET_BOWLER_CREDIT_WICKETS = {
+    "bowled",
+    "caught",
+    "caught and bowled",
+    "lbw",
+    "stumped",
+    "hit wicket",
+}
+
+BATTER_DISMISSAL_KINDS = {
+    "bowled",
+    "caught",
+    "caught and bowled",
+    "hit wicket",
+    "lbw",
+    "obstructing the field",
+    "retired out",
+    "run out",
+    "stumped",
+}
+
+
+@dataclass
+class ParseIssue:
+    source: str
+    level: str
+    message: str
+
+
+@dataclass
+class PipelineResult:
+    matches: pd.DataFrame
+    deliveries: pd.DataFrame
+    issues: pd.DataFrame
+
+
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(_as_text(item) for item in value if item is not None)
+    return str(value)
+
+
+def _first_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_float(value: Any, source: str, issues: list[ParseIssue], field: str) -> float:
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        issues.append(ParseIssue(source, "warning", f"Non-numeric value for {field}: {value!r}; using 0."))
+        return 0.0
+
+
+def _safe_json_load(raw: str, source: str, issues: list[ParseIssue]) -> dict[str, Any] | None:
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        issues.append(ParseIssue(source, "error", f"Invalid JSON: {exc.msg}"))
+        return None
+    if not isinstance(loaded, dict):
+        issues.append(ParseIssue(source, "error", "Top-level record is not a JSON object."))
+        return None
+    return loaded
+
+
+def _iter_sources(source_path: str | Path) -> Iterable[tuple[str, str]]:
+    path = Path(source_path)
+    if path.is_dir():
+        for item in sorted(path.glob("**/*.json")):
+            yield item.name, item.read_text(encoding="utf-8")
+        return
+
+    if path.suffix.lower() == ".zip":
+        try:
+            with ZipFile(path) as archive:
+                for entry in archive.infolist():
+                    if entry.is_dir() or not entry.filename.lower().endswith(".json"):
+                        continue
+                    with archive.open(entry) as handle:
+                        yield Path(entry.filename).name, handle.read().decode("utf-8", errors="replace")
+            return
+        except BadZipFile as exc:
+            raise ValueError(f"Unable to open ZIP archive: {path}") from exc
+
+    if path.is_file() and path.suffix.lower() == ".json":
+        yield path.name, path.read_text(encoding="utf-8")
+        return
+
+    raise FileNotFoundError(f"Unsupported source path: {path}")
+
+
+def _is_legal_delivery(delivery: dict[str, Any]) -> bool:
+    extras = delivery.get("extras") or {}
+    if not isinstance(extras, dict):
+        return True
+    return not extras.get("wides") and not extras.get("noballs")
+
+
+def _bowler_runs_conceded(delivery: dict[str, Any], source: str, issues: list[ParseIssue]) -> float:
+    runs = _as_dict(delivery.get("runs"))
+    extras = _as_dict(delivery.get("extras"))
+    return (
+        _safe_float(runs.get("total", 0), source, issues, "runs.total")
+        - _safe_float(extras.get("byes", 0), source, issues, "extras.byes")
+        - _safe_float(extras.get("legbyes", 0), source, issues, "extras.legbyes")
+    )
+
+
+def load_cricsheet_archive(source_path: str | Path) -> PipelineResult:
+    issues: list[ParseIssue] = []
+    match_rows: list[dict[str, Any]] = []
+    delivery_rows: list[dict[str, Any]] = []
+
+    for source_name, raw_json in _iter_sources(source_path):
+        record = _safe_json_load(raw_json, source_name, issues)
+        if record is None:
+            continue
+
+        info = record.get("info")
+        innings = record.get("innings")
+        if not isinstance(info, dict):
+            issues.append(ParseIssue(source_name, "warning", "Missing or invalid info section."))
+            continue
+        if not isinstance(innings, list) or not innings:
+            issues.append(ParseIssue(source_name, "warning", "Missing innings data."))
+            continue
+
+        teams = info.get("teams") or []
+        if not isinstance(teams, list) or len(teams) < 2:
+            issues.append(ParseIssue(source_name, "warning", "Skipping match with fewer than two teams."))
+            continue
+
+        outcome = _as_dict(info.get("outcome"))
+        toss = _as_dict(info.get("toss"))
+        season = _as_text(_first_value(info.get("season")))
+        venue = _as_text(info.get("venue"))
+        city = _as_text(info.get("city"))
+        match_date = _as_text(_first_value(info.get("dates")))
+        winner = _as_text(outcome.get("winner"))
+        result = _as_text(outcome.get("result"))
+        match_id = Path(source_name).stem
+
+        match_rows.append(
+            {
+                "match_id": match_id,
+                "source_file": source_name,
+                "season": season,
+                "date": match_date,
+                "venue": venue,
+                "city": city,
+                "team_1": _as_text(teams[0]),
+                "team_2": _as_text(teams[1]),
+                "toss_winner": _as_text(toss.get("winner")),
+                "toss_decision": _as_text(toss.get("decision")),
+                "winner": winner,
+                "result": result,
+                "match_type": _as_text(info.get("match_type")),
+            }
+        )
+
+        for innings_index, innings_entry in enumerate(innings, start=1):
+            if not isinstance(innings_entry, dict):
+                issues.append(ParseIssue(source_name, "warning", f"Invalid innings at index {innings_index}."))
+                continue
+            batting_team = _as_text(innings_entry.get("team"))
+            overs = innings_entry.get("overs")
+            if not isinstance(overs, list):
+                issues.append(ParseIssue(source_name, "warning", f"Missing overs for innings {innings_index}."))
+                continue
+
+            for over_index, over_entry in enumerate(overs):
+                if not isinstance(over_entry, dict):
+                    issues.append(ParseIssue(source_name, "warning", f"Invalid over at innings {innings_index}, over {over_index}."))
+                    continue
+                over_number = over_entry.get("over", over_index)
+                deliveries = over_entry.get("deliveries")
+                if not isinstance(deliveries, list):
+                    issues.append(ParseIssue(source_name, "warning", f"Missing deliveries at innings {innings_index}, over {over_number}."))
+                    continue
+
+                for ball_index, delivery in enumerate(deliveries, start=1):
+                    if not isinstance(delivery, dict):
+                        issues.append(ParseIssue(source_name, "warning", f"Invalid delivery at innings {innings_index}, over {over_number}, ball {ball_index}."))
+                        continue
+                    runs = delivery.get("runs") or {}
+                    if not isinstance(runs, dict):
+                        issues.append(ParseIssue(source_name, "warning", f"Missing runs object at innings {innings_index}, over {over_number}, ball {ball_index}."))
+                        continue
+
+                    batter = _as_text(delivery.get("batter"))
+                    bowler = _as_text(delivery.get("bowler"))
+                    non_striker = _as_text(delivery.get("non_striker"))
+                    legal_delivery = _is_legal_delivery(delivery)
+                    delivery_wickets = delivery.get("wickets") or []
+                    wicket_count = len(delivery_wickets) if isinstance(delivery_wickets, list) else 0
+                    dismissal_kinds = []
+                    dismissed_players = []
+                    bowler_wickets = 0
+
+                    if isinstance(delivery_wickets, list):
+                        for wicket in delivery_wickets:
+                            if not isinstance(wicket, dict):
+                                continue
+                            kind = _as_text(wicket.get("kind"))
+                            dismissed = _as_text(wicket.get("player_out"))
+                            dismissal_kinds.append(kind)
+                            dismissed_players.append(dismissed)
+                            if kind in CRICHEET_BOWLER_CREDIT_WICKETS:
+                                bowler_wickets += 1
+
+                    bowling_team = next((team for team in teams if _as_text(team) != batting_team), "")
+                    delivery_rows.append(
+                        {
+                            "match_id": match_id,
+                            "source_file": source_name,
+                            "season": season,
+                            "date": match_date,
+                            "venue": venue,
+                            "innings": innings_index,
+                            "over": int(over_number) if str(over_number).isdigit() else over_number,
+                            "ball_in_over": ball_index,
+                            "batting_team": batting_team,
+                            "bowling_team": _as_text(bowling_team),
+                            "batter": batter,
+                            "bowler": bowler,
+                            "non_striker": non_striker,
+                            "runs_batter": _safe_float(runs.get("batter", 0), source_name, issues, "runs.batter"),
+                            "runs_extras": _safe_float(runs.get("extras", 0), source_name, issues, "runs.extras"),
+                            "runs_total": _safe_float(runs.get("total", 0), source_name, issues, "runs.total"),
+                            "legal_delivery": legal_delivery,
+                            "wicket_count": wicket_count,
+                            "dismissal_kinds": "; ".join(kind for kind in dismissal_kinds if kind),
+                            "dismissed_players": "; ".join(player for player in dismissed_players if player),
+                            "bowler_wickets": bowler_wickets,
+                            "bowler_runs_conceded": _bowler_runs_conceded(delivery, source_name, issues),
+                        }
+                    )
+
+    matches_df = pd.DataFrame(match_rows)
+    deliveries_df = pd.DataFrame(delivery_rows)
+    issues_df = pd.DataFrame([issue.__dict__ for issue in issues])
+
+    if not matches_df.empty:
+        matches_df["season"] = matches_df["season"].replace("", pd.NA)
+        matches_df["season"] = matches_df["season"].astype("string")
+    if not deliveries_df.empty:
+        deliveries_df["season"] = deliveries_df["season"].replace("", pd.NA)
+        deliveries_df["season"] = deliveries_df["season"].astype("string")
+
+    return PipelineResult(matches=matches_df, deliveries=deliveries_df, issues=issues_df)
+
+
+def build_team_results(matches_df: pd.DataFrame) -> pd.DataFrame:
+    if matches_df.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for _, match in matches_df.iterrows():
+        has_winner = bool(match["winner"])
+        for team in (match["team_1"], match["team_2"]):
+            rows.append(
+                {
+                    "season": match["season"],
+                    "team": team,
+                    "match_id": match["match_id"],
+                    "decisive_match": has_winner,
+                    "won": bool(has_winner and team == match["winner"]),
+                    "lost": bool(has_winner and team != match["winner"]),
+                    "tied_or_no_result": not has_winner,
+                }
+            )
+    team_matches = pd.DataFrame(rows)
+    summary = (
+        team_matches.groupby(["season", "team"], dropna=False)
+        .agg(
+            matches=("match_id", "count"),
+            decisive_matches=("decisive_match", "sum"),
+            wins=("won", "sum"),
+            losses=("lost", "sum"),
+            tied_or_no_results=("tied_or_no_result", "sum"),
+        )
+        .reset_index()
+    )
+    summary["win_rate"] = summary["wins"] / summary["decisive_matches"].replace(0, pd.NA)
+    return summary
+
+
+def build_batting_summary(deliveries_df: pd.DataFrame) -> pd.DataFrame:
+    if deliveries_df.empty:
+        return pd.DataFrame()
+
+    batting = deliveries_df.copy()
+    batting["is_boundary_four"] = batting["runs_batter"] == 4
+    batting["is_boundary_six"] = batting["runs_batter"] == 6
+
+    # Build dismissal counts without per-row lambdas for faster large-season processing.
+    dismissed = (
+        batting.loc[:, ["season", "dismissed_players", "dismissal_kinds"]]
+        .assign(
+            dismissed_player=lambda df: df["dismissed_players"].fillna("").astype(str).str.split(";"),
+            dismissal_kind=lambda df: df["dismissal_kinds"].fillna("").astype(str).str.split(";"),
+        )
+        .explode(["dismissed_player", "dismissal_kind"])
+    )
+    dismissed["dismissed_player"] = dismissed["dismissed_player"].astype(str).str.strip()
+    dismissed["dismissal_kind"] = dismissed["dismissal_kind"].astype(str).str.strip()
+    dismissed = dismissed[
+        (dismissed["dismissed_player"] != "")
+        & (dismissed["dismissal_kind"].isin(BATTER_DISMISSAL_KINDS))
+    ]
+    dismissals = (
+        dismissed.groupby(["season", "dismissed_player"], dropna=False)
+        .size()
+        .reset_index(name="dismissals")
+        .rename(columns={"dismissed_player": "batter"})
+    )
+
+    summary = (
+        batting.groupby(["season", "batter"], dropna=False)
+        .agg(
+            runs=("runs_batter", "sum"),
+            balls=("legal_delivery", "sum"),
+            fours=("is_boundary_four", "sum"),
+            sixes=("is_boundary_six", "sum"),
+        )
+        .reset_index()
+    )
+    summary = summary.merge(dismissals, on=["season", "batter"], how="left")
+    summary["dismissals"] = summary["dismissals"].fillna(0)
+    summary["strike_rate"] = summary["runs"] / summary["balls"].replace(0, pd.NA) * 100
+    summary["average"] = summary["runs"] / summary["dismissals"].replace(0, pd.NA)
+    summary["boundary_runs"] = summary["fours"] * 4 + summary["sixes"] * 6
+    return summary.sort_values(["season", "runs"], ascending=[True, False])
+
+
+def build_bowling_summary(deliveries_df: pd.DataFrame) -> pd.DataFrame:
+    if deliveries_df.empty:
+        return pd.DataFrame()
+
+    bowling = deliveries_df.copy()
+    summary = (
+        bowling.groupby(["season", "bowler"], dropna=False)
+        .agg(
+            balls=("legal_delivery", "sum"),
+            runs_conceded=("bowler_runs_conceded", "sum"),
+            wickets=("bowler_wickets", "sum"),
+        )
+        .reset_index()
+    )
+    summary["economy"] = summary["runs_conceded"] / (summary["balls"] / 6).replace(0, pd.NA)
+    summary["average"] = summary["runs_conceded"] / summary["wickets"].replace(0, pd.NA)
+    summary["strike_rate"] = summary["balls"] / summary["wickets"].replace(0, pd.NA)
+    return summary.sort_values(["season", "wickets", "economy"], ascending=[True, False, True])
+
+
+def build_match_metrics(matches_df: pd.DataFrame, deliveries_df: pd.DataFrame) -> pd.DataFrame:
+    if matches_df.empty or deliveries_df.empty:
+        return pd.DataFrame()
+
+    first_innings = deliveries_df[deliveries_df["innings"] == 1].groupby("match_id", as_index=False).agg(
+        first_innings_runs=("runs_total", "sum"),
+        first_innings_balls=("legal_delivery", "sum"),
+        first_innings_batting_team=("batting_team", "first"),
+    )
+    merged = matches_df.merge(first_innings, on="match_id", how="left")
+    merged["decisive_match"] = merged["winner"].astype(str).str.len() > 0
+    merged["toss_winner_won"] = merged["decisive_match"] & merged["winner"].eq(merged["toss_winner"])
+    merged["batting_first_won"] = merged["decisive_match"] & merged["winner"].eq(merged["first_innings_batting_team"])
+    merged["chasing_won"] = merged["decisive_match"] & merged["winner"].ne(merged["first_innings_batting_team"])
+    merged["result_label"] = merged["winner"].where(merged["winner"].astype(bool), merged["result"])
+    return merged
+
+
+def build_venue_summary(match_metrics_df: pd.DataFrame) -> pd.DataFrame:
+    if match_metrics_df.empty:
+        return pd.DataFrame()
+
+    summary = (
+        match_metrics_df.groupby("venue", dropna=False)
+        .agg(
+            matches=("match_id", "count"),
+            decisive_matches=("decisive_match", "sum"),
+            avg_first_innings_runs=("first_innings_runs", "mean"),
+            batting_first_wins=("batting_first_won", "sum"),
+            chasing_wins=("chasing_won", "sum"),
+            toss_winner_wins=("toss_winner_won", "sum"),
+        )
+        .reset_index()
+    )
+    denominator = summary["decisive_matches"].replace(0, pd.NA)
+    summary["batting_first_win_rate"] = summary["batting_first_wins"] / denominator
+    summary["chasing_win_rate"] = summary["chasing_wins"] / denominator
+    summary["toss_winner_win_rate"] = summary["toss_winner_wins"] / denominator
+    return summary.sort_values(["matches", "avg_first_innings_runs"], ascending=[False, False])
+
+
+def build_toss_summary(match_metrics_df: pd.DataFrame) -> pd.DataFrame:
+    if match_metrics_df.empty:
+        return pd.DataFrame()
+
+    summary = (
+        match_metrics_df.groupby(["season", "toss_decision"], dropna=False)
+        .agg(
+            matches=("match_id", "count"),
+            decisive_matches=("decisive_match", "sum"),
+            toss_winner_wins=("toss_winner_won", "sum"),
+        )
+        .reset_index()
+    )
+    summary["toss_winner_win_rate"] = summary["toss_winner_wins"] / summary["decisive_matches"].replace(0, pd.NA)
+    return summary
+
 
 BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-DATASET_PATH = BASE_DIR / "ipl_json.zip"
+DEFAULT_SOURCE = BASE_DIR / "ipl_json.zip"
 
-app = FastAPI(
-    title="IPL Analytics Dashboard",
-    description="Interactive IPL analytics built on the full Cricsheet archive.",
-    version="3.0.0",
-)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app = FastAPI(title="IPL Analytics Dashboard")
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
-class ChatRequest(BaseModel):
-    question: str
-    seasons: list[str] = ["All"]
-    teams: list[str] = []
-    venues: list[str] = []
-
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-
-def _clean(v: Any) -> Any:
-    if pd.isna(v):
-        return None
-    if isinstance(v, float):
-        return round(v, 4)
-    return v
-
-
-def _records(df: pd.DataFrame, limit: int | None = None) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    rows = df.head(limit).copy() if limit else df.copy()
-    return [{k: _clean(val) for k, val in row.items()} for row in rows.to_dict("records")]
-
-
-def _split(values: list[str] | None) -> list[str]:
-    if not values:
-        return []
-    out: list[str] = []
-    for v in values:
-        out.extend(p.strip() for p in v.split(",") if p.strip())
-    return out
+def _source_path() -> Path:
+    if DEFAULT_SOURCE.exists():
+        return DEFAULT_SOURCE
+    return Path("ipl_json.zip")
 
 
 @lru_cache(maxsize=1)
-def _load() -> PipelineResult:
-    return load_cricsheet_archive(DATASET_PATH)
+def _load_result() -> PipelineResult:
+    source = _source_path()
+    try:
+        return load_cricsheet_archive(source)
+    except (FileNotFoundError, ValueError) as exc:
+        issue = pd.DataFrame(
+            [
+                {
+                    "source": str(source),
+                    "level": "error",
+                    "message": str(exc),
+                }
+            ]
+        )
+        return PipelineResult(matches=pd.DataFrame(), deliveries=pd.DataFrame(), issues=issue)
 
 
-def _filter(result: PipelineResult, seasons: list[str], teams: list[str], venues: list[str]):
-    m = result.matches.copy()
-    d = result.deliveries.copy()
-    if seasons and "All" not in seasons:
-        m = m[m["season"].astype(str).isin(seasons)]
-        d = d[d["season"].astype(str).isin(seasons)]
-    if teams:
-        m = m[m["team_1"].isin(teams) | m["team_2"].isin(teams)]
-        d = d[d["batting_team"].isin(teams) | d["bowling_team"].isin(teams)]
-    if venues:
-        m = m[m["venue"].isin(venues)]
-        d = d[d["venue"].isin(venues)]
-    mids = set(m["match_id"].astype(str))
-    d = d[d["match_id"].astype(str).isin(mids)]
-    return m, d
+def _normalize_values(values: list[str] | None) -> list[str]:
+    if not values:
+        return []
+    return [value for value in values if value and value != "All"]
 
 
-def _ctx(seasons: list[str], teams: list[str], venues: list[str]) -> dict:
-    result = _load()
-    m, d = _filter(result, seasons, teams, venues)
-    team_results = build_team_results(m)
-    batting  = build_batting_summary(d)
-    bowling  = build_bowling_summary(d)
-    mm       = build_match_metrics(m, d)
-    venues_s = build_venue_summary(mm)
-    toss_s   = build_toss_summary(mm)
-    return dict(matches=m, deliveries=d, issues=result.issues,
-                team_results=team_results, batting=batting, bowling=bowling,
-                match_metrics=mm, venues=venues_s, toss=toss_s)
+def _filter_result(
+    result: PipelineResult,
+    seasons: list[str] | None = None,
+    teams: list[str] | None = None,
+    venues: list[str] | None = None,
+) -> PipelineResult:
+    matches = result.matches.copy()
+    deliveries = result.deliveries.copy()
+
+    seasons = _normalize_values(seasons)
+    teams = _normalize_values(teams)
+    venues = _normalize_values(venues)
+
+    if not matches.empty:
+        if seasons and "season" in matches:
+            matches = matches[matches["season"].isin(seasons)]
+        if teams:
+            matches = matches[matches["team_1"].isin(teams) | matches["team_2"].isin(teams)]
+        if venues and "venue" in matches:
+            matches = matches[matches["venue"].isin(venues)]
+
+    if not deliveries.empty and not matches.empty:
+        allowed_match_ids = set(matches["match_id"].astype(str))
+        deliveries = deliveries[deliveries["match_id"].astype(str).isin(allowed_match_ids)]
+
+    return PipelineResult(matches=matches, deliveries=deliveries, issues=result.issues.copy())
 
 
-# ─── Aggregation helpers ──────────────────────────────────────────────────────
-
-def _teams_overall(tr: pd.DataFrame) -> pd.DataFrame:
-    if tr.empty:
-        return pd.DataFrame()
-    g = (
-        tr.groupby("team", as_index=False)
-        .agg(matches=("matches","sum"), decisive_matches=("decisive_matches","sum"),
-             wins=("wins","sum"), losses=("losses","sum"),
-             tied_or_no_results=("tied_or_no_results","sum"))
-    )
-    g["win_rate"] = g["wins"] / g["decisive_matches"].replace(0, pd.NA)
-    return g.sort_values(["win_rate","wins"], ascending=False)
+def _top_row(frame: pd.DataFrame, sort_cols: list[str], ascending: list[bool]) -> pd.Series | None:
+    if frame.empty:
+        return None
+    ordered = frame.sort_values(sort_cols, ascending=ascending)
+    if ordered.empty:
+        return None
+    return ordered.iloc[0]
 
 
-def _batting_overall(bat: pd.DataFrame) -> pd.DataFrame:
-    if bat.empty:
-        return pd.DataFrame()
-    g = (
-        bat.groupby("batter", as_index=False)
-        .agg(runs=("runs","sum"), balls=("balls","sum"), fours=("fours","sum"),
-             sixes=("sixes","sum"), dismissals=("dismissals","sum"))
-    )
-    g["strike_rate"] = g["runs"] / g["balls"].replace(0, pd.NA) * 100
-    g["average"]     = g["runs"] / g["dismissals"].replace(0, pd.NA)
-    return g.sort_values(["runs","strike_rate"], ascending=[False,False])
+def _frame_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    if frame.empty:
+        return []
+
+    clean = frame.copy()
+    for column in clean.columns:
+        if pd.api.types.is_numeric_dtype(clean[column]):
+            clean[column] = clean[column].fillna(0)
+        else:
+            clean[column] = clean[column].astype(object).where(clean[column].notna(), "")
+
+    return cast(list[dict[str, Any]], clean.to_dict(orient="records"))
 
 
-def _bowling_overall(bowl: pd.DataFrame) -> pd.DataFrame:
-    if bowl.empty:
-        return pd.DataFrame()
-    g = (
-        bowl.groupby("bowler", as_index=False)
-        .agg(balls=("balls","sum"), runs_conceded=("runs_conceded","sum"),
-             wickets=("wickets","sum"))
-    )
-    g["economy"]     = g["runs_conceded"] / (g["balls"] / 6).replace(0, pd.NA)
-    g["average"]     = g["runs_conceded"] / g["wickets"].replace(0, pd.NA)
-    g["strike_rate"] = g["balls"] / g["wickets"].replace(0, pd.NA)
-    return g.sort_values(["wickets","economy"], ascending=[False,True])
+def build_season_history(match_metrics_df: pd.DataFrame, batting_df: pd.DataFrame, bowling_df: pd.DataFrame) -> list[dict[str, Any]]:
+    if match_metrics_df.empty:
+        return []
 
+    rows: list[dict[str, Any]] = []
+    for season in sorted(match_metrics_df["season"].dropna().astype(str).unique()):
+        season_matches = match_metrics_df[match_metrics_df["season"].astype(str) == season]
+        season_batters = batting_df[batting_df["season"].astype(str) == season]
+        season_bowlers = bowling_df[bowling_df["season"].astype(str) == season]
 
-def _safe_pct(num: float, den: float) -> float:
-    return round(float(num) / float(den), 4) if den else 0.0
+        top_batter = _top_row(season_batters, ["runs", "strike_rate"], [False, False])
+        top_bowler = _top_row(season_bowlers, ["wickets", "economy"], [False, True])
 
-
-# ─── Chatbot ──────────────────────────────────────────────────────────────────
-
-def answer_question(question: str, ctx: dict) -> str:
-    q = question.lower().strip()
-    teams   = _teams_overall(ctx["team_results"])
-    batting = _batting_overall(ctx["batting"])
-    bowling = _bowling_overall(ctx["bowling"])
-    venues  = ctx["venues"]
-    mm      = ctx["match_metrics"]
-
-    if not q:
-        return "Ask me anything about IPL! Try: 'Who has the best win rate?' or 'Tell me about IPL history.'"
-
-    # ── IPL history ──────────────────────────────────────────────────────────
-    if any(w in q for w in ["history","what is ipl","ipl started","ipl founded","tell me about","explain ipl","origin","bcci","lalit"]):
-        return (
-            "🏏 The Indian Premier League (IPL) started in 2008!\n\n"
-            "Think of it like this — just as cities in England have football clubs,\n"
-            "Indian cities have their own cricket teams in the IPL! Mumbai, Chennai,\n"
-            "Kolkata, Delhi, Bangalore... they all compete for the big trophy!\n\n"
-            "📅 First ever match: April 18, 2008 — Bangalore vs Kolkata\n"
-            "🏆 Most successful: Mumbai Indians & Chennai Super Kings (5 titles each!)\n"
-            "💰 League value: Over $10 Billion — cricket's richest competition\n"
-            "🌍 Fans worldwide: 750 million+ people watch IPL every year!\n"
-            "⚡ Fun Fact: IPL was created by Lalit Modi of the BCCI. The first auction\n"
-            "   sold Sachin Tendulkar for ₹6.9 crore — a cricket legend going on auction! 😮"
+        rows.append(
+            {
+                "season": season,
+                "matches": int(len(season_matches)),
+                "avg_runs": float(season_matches["first_innings_runs"].mean()) if "first_innings_runs" in season_matches and not season_matches["first_innings_runs"].empty else None,
+                "top_scorer": None if top_batter is None else str(top_batter.get("batter", "")),
+                "top_scorer_runs": None if top_batter is None else float(top_batter.get("runs", 0)),
+                "top_bowler": None if top_bowler is None else str(top_bowler.get("bowler", "")),
+                "top_bowler_wickets": None if top_bowler is None else float(top_bowler.get("wickets", 0)),
+            }
         )
 
-    # ── T20 cricket basics ───────────────────────────────────────────────────
-    if any(w in q for w in ["how to play","cricket rules","what is t20","twenty20","t20 format","basics of cricket","explain cricket","cricket for beginner"]):
-        return (
-            "🏏 T20 Cricket — Easy Explained!\n\n"
-            "Think of it like the 'fast food' version of cricket (full cricket = 5 days! 😄)\n\n"
-            "Step 1: Two teams — one BATS, one BOWLS (fields)\n"
-            "Step 2: The batting team gets 20 OVERS (1 over = 6 balls = 120 balls total)\n"
-            "Step 3: Batters try to score RUNS by hitting the ball\n"
-            "         • Ball reaches the rope (boundary) = 4 runs 🎯\n"
-            "         • Ball clears the rope (six) = 6 runs! 🎆\n"
-            "Step 4: Bowling team tries to get batters OUT (= wicket)\n"
-            "Step 5: Teams switch after 20 overs or 10 wickets\n"
-            "Step 6: Second team needs to beat the first team's total to WIN! 🏆\n\n"
-            "A T20 match lasts about 3 hours — perfect for an evening game! ⏰"
-        )
+    return rows
 
-    # ── IPL format ───────────────────────────────────────────────────────────
-    if any(w in q for w in ["format","how does ipl work","how many team","playoff","qualifier","knockout","league stage","structure"]):
-        return (
-            "📋 How the IPL Tournament Works:\n\n"
-            "🔵 PHASE 1 — League Stage (the main tournament):\n"
-            "   • 10 teams each play 14 matches\n"
-            "   • Like a school class tournament — everyone plays everyone!\n"
-            "   • Top 4 teams advance to the Playoffs\n\n"
-            "🔴 PHASE 2 — Playoffs (the exciting knockout stage):\n"
-            "   • Qualifier 1: Team 1 vs Team 2 → Winner goes straight to Final! ✅\n"
-            "   • Eliminator: Team 3 vs Team 4 → Loser goes home 😢\n"
-            "   • Qualifier 2: Loser of Q1 vs Winner of Eliminator → Winner reaches Final\n"
-            "   • 🏆 GRAND FINAL: Two remaining teams battle it out!\n\n"
-            "Current 10 Teams: CSK, MI, RCB, KKR, RR, SRH, DC, PBKS, GT, LSG"
-        )
 
-    # ── IPL champions ────────────────────────────────────────────────────────
-    if any(w in q for w in ["champion","winner","title","trophy","most title","won ipl","best team ever","who won"]):
-        return (
-            "🏆 IPL Champions — All-Time Winners List!\n\n"
-            "👑 5 TITLES each:\n"
-            "   • Mumbai Indians (2013, 2015, 2017, 2019, 2020)\n"
-            "   • Chennai Super Kings (2010, 2011, 2018, 2021, 2023)\n\n"
-            "🥈 3 TITLES:\n"
-            "   • Kolkata Knight Riders (2012, 2014, 2024)\n\n"
-            "🥉 2 TITLES:\n"
-            "   • Rajasthan Royals (2008, 2022)\n"
-            "   • Sunrisers Hyderabad (2016) + 1 more?\n\n"
-            "1 TITLE each:\n"
-            "   • Deccan Chargers (2009), Gujarat Titans (2022)\n\n"
-            "💡 Fun Fact: Chennai Super Kings qualified for IPL Playoffs in\n"
-            "   ALL their seasons except 2 — an almost perfect record! 😮"
-        )
+def build_records(matches_df: pd.DataFrame, deliveries_df: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
+    if matches_df.empty or deliveries_df.empty:
+        return {"topInnings": [], "topTotals": [], "topBowling": []}
 
-    # ── IPL auction ──────────────────────────────────────────────────────────
-    if any(w in q for w in ["auction","salary","expensive","crore","money","bid","price","bought","cost"]):
-        return (
-            "💰 IPL Auction — Where Players Become Millionaires!\n\n"
-            "Before each season, teams BID for players like an online auction!\n\n"
-            "📏 Rules:\n"
-            "   • Each team gets a budget (salary cap) of ₹120 crore (~$14M)\n"
-            "   • Teams can RETAIN 3-4 star players without auction\n"
-            "   • For the rest, teams bid — highest bid wins the player!\n\n"
-            "💎 Biggest Auction Sales Ever:\n"
-            "   🥇 Mitchell Starc (KKR, 2024): ₹24.75 crore — ALL-TIME RECORD!\n"
-            "   🥈 Pat Cummins (SRH, 2024): ₹20.5 crore\n"
-            "   🥉 Sam Curran (PBKS, 2023): ₹18.5 crore\n\n"
-            "For reference: ₹24.75 crore = about $3 million just for ONE cricket season! 🤑"
-        )
+    match_lookup = matches_df[["match_id", "team_1", "team_2", "season", "venue"]].drop_duplicates("match_id")
 
-    # ── Records (data-driven) ────────────────────────────────────────────────
-    if any(w in q for w in ["record","highest","most runs","most wicket","all time","milestone","best ever"]):
-        parts = []
-        if not batting.empty:
-            r = batting.iloc[0]
-            parts.append(f"🏏 Most Runs: {r['batter']} — {int(r['runs'])} runs (SR: {r['strike_rate']:.1f})")
-        if not bowling.empty:
-            r = bowling.iloc[0]
-            parts.append(f"⚡ Most Wickets: {r['bowler']} — {int(r['wickets'])} wkts (ECO: {r['economy']:.2f})")
-        data_line = "\n".join(parts)
-        return (
-            f"📈 Records in Current View:\n{data_line}\n\n"
-            "🌟 Famous All-Time IPL Records:\n"
-            "   • Most IPL runs ever: Virat Kohli — 9,000+ runs 👑\n"
-            "   • Highest team score: RCB — 263/5 (vs Pune Warriors, 2013)\n"
-            "   • Most wickets: Yuzvendra Chahal — 200+ wickets 🎯\n"
-            "   • Fastest fifty: Chris Gayle — just 17 balls! ⚡\n"
-            "   • Most sixes in IPL history: Chris Gayle — 350+ sixes 💥\n"
-            "   • Highest individual T20 score: Chris Gayle — 175* (off 66 balls!)"
+    batting_innings = (
+        deliveries_df.groupby(["match_id", "innings", "batting_team", "season", "venue"], dropna=False)
+        .agg(
+            runs=("runs_batter", "sum"),
+            balls=("legal_delivery", "sum"),
+            fours=("runs_batter", lambda series: int((series == 4).sum())),
+            sixes=("runs_batter", lambda series: int((series == 6).sum())),
         )
-
-    # ── Best team (data-driven) ──────────────────────────────────────────────
-    if any(w in q for w in ["team","win rate","strongest team","best team","which team"]):
-        if teams.empty:
-            return "No team data available for the current filters."
-        r = teams.iloc[0]
-        return (
-            f"🏆 Best team in current view: {r['team']}!\n\n"
-            f"Win Rate: {r['win_rate']:.1%}\n"
-            f"That means they win {r['win_rate']*100:.0f} out of every 100 matches they play!\n\n"
-            f"📊 Their record:\n"
-            f"   Wins: {int(r['wins'])} | Losses: {int(r['losses'])} | "
-            f"Total decisive matches: {int(r['decisive_matches'])}\n\n"
-            f"💡 Think of win rate like a grade in school:\n"
-            f"   60%+ = Excellent ⭐ | 50-60% = Good 👍 | Below 50% = Struggling 😅"
-        )
-
-    # ── Top batter (data-driven) ─────────────────────────────────────────────
-    if any(w in q for w in ["batter","batsman","top scorer","most run","run scorer","batting"]):
-        if batting.empty:
-            return "No batting data available for the current filters."
-        r = batting.iloc[0]
-        return (
-            f"🏏 Top Batter: {r['batter']}!\n\n"
-            f"Runs scored: {int(r['runs'])}\n"
-            f"Balls faced: {int(r['balls'])}\n"
-            f"Strike Rate: {r['strike_rate']:.1f} — this means for every 100 balls,\n"
-            f"  they score {r['strike_rate']:.0f} runs. Above 140 = excellent! ⚡\n"
-            f"Average: {r['average']:.1f if not pd.isna(r['average']) else 'N/A'} — runs per dismissal\n\n"
-            f"💡 Strike Rate explained for beginners:\n"
-            f"   If you score 6 runs off 4 balls → SR = 6/4 × 100 = 150! Really fast! 🚀"
-        )
-
-    # ── Top bowler (data-driven) ─────────────────────────────────────────────
-    if any(w in q for w in ["bowler","wicket","most wicket","bowling","wicket taker"]):
-        if bowling.empty:
-            return "No bowling data available for the current filters."
-        r = bowling.iloc[0]
-        return (
-            f"⚡ Top Bowler: {r['bowler']}!\n\n"
-            f"Wickets taken: {int(r['wickets'])}\n"
-            f"Economy Rate: {r['economy']:.2f} — they give away only {r['economy']:.2f} runs per over.\n"
-            f"   Lower economy = better bowler! Under 7.5 is excellent in T20. 🎯\n\n"
-            f"💡 Wicket explained for beginners:\n"
-            f"   A 'wicket' means the batter is OUT! Getting wickets is how bowlers\n"
-            f"   win matches for their team. 5 wickets in one innings = 'Five-For' (very rare!) 🏆"
-        )
-
-    # ── Toss (data-driven) ───────────────────────────────────────────────────
-    if any(w in q for w in ["toss","coin","bat first","field first","chase","chasing"]):
-        if mm.empty:
-            return "No toss data available for the current filters."
-        rate = _safe_pct(mm["toss_winner_won"].sum(), mm["decisive_match"].sum())
-        verdict = ("YES! Winning the toss gives a real advantage here! 🪙"
-                   if rate > 0.55 else
-                   "Not really — the toss doesn't decide the winner much! 💪"
-                   if rate < 0.48 else
-                   "A slight edge, but skill matters more than the coin! ⚖️")
-        return (
-            f"🪙 Toss Impact Analysis:\n\n"
-            f"Toss winners won: {rate:.1%} of matches\n"
-            f"Verdict: {verdict}\n\n"
-            f"🧠 How to interpret this:\n"
-            f"   • If toss had ZERO effect → we'd expect exactly 50%\n"
-            f"   • Above 55% → toss really helps!\n"
-            f"   • Below 45% → toss actually HURTS? (rare but possible!)\n\n"
-            f"📊 In modern IPL, most captains choose to FIELD first (bowl)\n"
-            f"   because chasing is easier — you know the exact score to beat! 🎯"
-        )
-
-    # ── Venue (data-driven) ──────────────────────────────────────────────────
-    if any(w in q for w in ["venue","ground","stadium","best venue","worst venue","wankhede","eden","chepauk","chinnaswamy"]):
-        if venues.empty:
-            return "No venue data available for the current filters."
-        best_chase = venues.sort_values("chasing_win_rate", ascending=False).iloc[0]
-        best_bat   = venues.sort_values("batting_first_win_rate", ascending=False).iloc[0]
-        hi_score   = venues.sort_values("avg_first_innings_runs", ascending=False).iloc[0]
-        return (
-            f"🏟️ Venue Insights!\n\n"
-            f"Best for CHASING (batting 2nd):\n"
-            f"  → {best_chase['venue']} ({best_chase['chasing_win_rate']:.1%} chase win rate!)\n\n"
-            f"Best for DEFENDING (batting 1st):\n"
-            f"  → {best_bat['venue']} ({best_bat['batting_first_win_rate']:.1%} defend rate!)\n\n"
-            f"Highest scoring ground:\n"
-            f"  → {hi_score['venue']} (avg 1st innings: {hi_score['avg_first_innings_runs']:.0f} runs)\n\n"
-            f"🌟 Famous IPL Venues to know:\n"
-            f"  • Wankhede (Mumbai): Small boundaries → TONS of sixes! ⚡\n"
-            f"  • Eden Gardens (Kolkata): 68,000 fans — the LOUDEST stadium! 📣\n"
-            f"  • Chepauk (Chennai): Slow pitch → bowlers love it here! 🎯"
-        )
-
-    # ── Famous players ────────────────────────────────────────────────────────
-    if any(w in q for w in ["dhoni","mahi","ms dhoni","csk captain","captain cool"]):
-        return (
-            "🦁 MS Dhoni — The Legend of IPL!\n\n"
-            "Full name: Mahendra Singh Dhoni\n"
-            "Team: Chennai Super Kings (CSK)\n"
-            "IPL Titles as Captain: 5 (the most anyone has won!)\n"
-            "Nickname: 'Captain Cool' — he NEVER panics under pressure!\n\n"
-            "🚁 Famous for his 'Helicopter Shot' — he swings the bat in a full circle\n"
-            "   like a helicopter rotor and sends the ball for a six!\n\n"
-            "🏅 Why he is special:\n"
-            "   • Won World Cup, Champions Trophy AND IPL — complete champion!\n"
-            "   • Best finisher — can win matches in the very last ball 😮\n"
-            "   • As a wicket-keeper, his LIGHTNING fast stumpings are legendary!\n\n"
-            "Fun Fact: Before cricket stardom, Dhoni was a railway ticket collector\n"
-            "at Kharagpur station! From TTE to Champion — what a journey! 🚂"
-        )
-
-    if any(w in q for w in ["kohli","virat","king kohli","rcb","royal challengers"]):
-        return (
-            "👑 Virat Kohli — The Run Machine!\n\n"
-            "Team: Royal Challengers Bengaluru (RCB)\n"
-            "IPL Runs: 9,000+ — the ALL-TIME record! (No one else is even close!)\n"
-            "Nickname: 'King Kohli' or 'The Chase Master'\n\n"
-            "📊 His Best IPL Season (2016):\n"
-            "   973 runs in a single season — still the record!\n"
-            "   4 consecutive Man of the Match awards — incredible consistency!\n\n"
-            "💡 He scores runs like collecting coins in a video game — fast,\n"
-            "   consistent, and he never stops! 🎮\n\n"
-            "Fun Fact: RCB fans are the most passionate in IPL — they fill\n"
-            "Chinnaswamy Stadium even when RCB struggles. Their loyalty = legendary! 😅"
-        )
-
-    if any(w in q for w in ["rohit","hitman","mumbai indians","mi captain","sharma"]):
-        return (
-            "💙 Rohit Sharma — The Hitman!\n\n"
-            "Team: Mumbai Indians (MI)\n"
-            "IPL Titles as Captain: 5 (equals Dhoni's record!)\n"
-            "Nickname: 'Hitman' because he HITS the ball incredibly hard!\n\n"
-            "🏆 Mumbai Indians under Rohit:\n"
-            "   Won the title in alternating years: 2013, 2015, 2017, 2019, 2020!\n"
-            "   They're like the New York Yankees of cricket — always competitive!\n\n"
-            "Fun Fact: MI is supported by Reliance Industries (one of India's biggest\n"
-            "companies), making them the richest franchise in IPL! 💰\n"
-            "Their fans call themselves the 'MI Paltan' (MI Army)! 💙"
-        )
-
-    if any(w in q for w in ["gayle","universe boss","chris gayle","six"]):
-        return (
-            "💥 Chris Gayle — The Universe Boss!\n\n"
-            "From: Jamaica, West Indies 🌴\n"
-            "Teams: RCB, PBKS, and more\n"
-            "IPL Sixes: 350+ — THE MOST EVER! 🚀\n\n"
-            "🌟 His mind-blowing records:\n"
-            "   • Fastest IPL century: 30 balls (THIRTY! Most players take 60+)\n"
-            "   • Highest T20 score: 175* off 66 balls (2013, for RCB vs Pune)\n"
-            "   • 17 sixes in ONE innings at one point!\n\n"
-            "When Gayle hits a six, the ball often lands OUTSIDE the stadium! 😮\n"
-            "He once said: 'I am the Universe Boss. The game belongs to me!' 😄\n\n"
-            "Fun Fact: Gayle's famous 'gangnam style' celebrations after sixes\n"
-            "made the whole stadium dance with him! 🕺"
-        )
-
-    # ── Chatbot help ─────────────────────────────────────────────────────────
-    if any(w in q for w in ["help","suggest","what can you","question","ask"]):
-        return (
-            "💬 What I Can Help You With!\n\n"
-            "🏆 Teams & Performance:\n"
-            "   'Who has the best win rate?' | 'Tell me about IPL champions'\n\n"
-            "🏏 Players:\n"
-            "   'Which batter scored most runs?' | 'Top wicket taker?'\n"
-            "   'Tell me about Dhoni/Kohli/Rohit'\n\n"
-            "📊 Analysis:\n"
-            "   'Does winning the toss help?' | 'Best venue for chasing?'\n\n"
-            "📚 Cricket Education:\n"
-            "   'What is T20 cricket?' | 'How does IPL work?'\n"
-            "   'What is a wicket?' | 'Tell me about IPL history'\n\n"
-            "🎊 Fun stuff:\n"
-            "   'IPL fun facts' | 'Tell me about Chris Gayle'\n"
-            "   'What is the IPL auction?'"
-        )
-
-    # ── Fun facts ────────────────────────────────────────────────────────────
-    if any(w in q for w in ["fun fact","interesting fact","did you know","trivia","cool"]):
-        return (
-            "🎊 Amazing IPL Facts You Probably Didn't Know!\n\n"
-            "1. 🎵 IPL has its own anthem: 'Ye Hai Nayi Duniya' ('This is a New World')\n"
-            "2. 🌍 Players from 25+ different countries play in the IPL!\n"
-            "3. 🏟️ Largest IPL crowd ever: 101,566 fans at Narendra Modi Stadium!\n"
-            "4. 🎂 First IPL auction: Sachin Tendulkar sold for ₹6.9 crore (2008)\n"
-            "5. 🌡️ Chennai matches are in 40°C heat — players sweat buckets!\n"
-            "6. 💡 The IPL pink ball night matches started in 2013 (first ever in T20!)\n"
-            "7. 📱 IPL is the most-followed sports league in South Asia on social media\n"
-            "8. 🦁 CSK's mascot is a Super King lion. KKR's is a knight on horseback! 🐴"
-        )
-
-    # ── Fallback ─────────────────────────────────────────────────────────────
-    return (
-        "🤔 Hmm, I'm not sure about that specific question!\n\n"
-        "But I know loads about IPL! Try:\n"
-        "   • 'What is IPL?' — for history\n"
-        "   • 'Best team?' — for win rate stats\n"
-        "   • 'Top batter?' — for batting numbers\n"
-        "   • 'Toss impact?' — for toss analysis\n"
-        "   • 'Fun facts?' — for cool IPL trivia 🎊\n"
-        "   • 'Help' — to see everything I can answer!\n\n"
-        "Or just explore the dashboard — the charts tell the story! 📊"
+        .reset_index()
+        .merge(match_lookup, on="match_id", how="left")
+        .sort_values(["runs", "balls"], ascending=[False, True])
+        .head(10)
     )
 
+    first_innings = (
+        deliveries_df[deliveries_df["innings"] == 1]
+        .groupby(["match_id", "batting_team", "season", "venue"], dropna=False)
+        .agg(total=("runs_total", "sum"))
+        .reset_index()
+        .merge(match_lookup, on="match_id", how="left")
+        .sort_values(["total", "match_id"], ascending=[False, True])
+        .head(10)
+    )
 
-# ─── Routes ───────────────────────────────────────────────────────────────────
+    bowling_figures = (
+        deliveries_df.groupby(["match_id", "bowler", "season", "venue"], dropna=False)
+        .agg(
+            wickets=("bowler_wickets", "sum"),
+            runs=("bowler_runs_conceded", "sum"),
+            balls=("legal_delivery", "sum"),
+        )
+        .reset_index()
+        .merge(match_lookup, on="match_id", how="left")
+        .sort_values(["wickets", "runs", "balls"], ascending=[False, True, True])
+        .head(10)
+    )
+
+    return {
+        "topInnings": cast(list[dict[str, Any]], batting_innings.to_dict(orient="records")),
+        "topTotals": cast(list[dict[str, Any]], first_innings.to_dict(orient="records")),
+        "topBowling": cast(list[dict[str, Any]], bowling_figures.to_dict(orient="records")),
+    }
+
+
+def _aggregate_dashboard(result: PipelineResult) -> dict[str, Any]:
+    matches = result.matches
+    deliveries = result.deliveries
+
+    match_metrics = build_match_metrics(matches, deliveries)
+    team_results = build_team_results(matches)
+    batting = build_batting_summary(deliveries)
+    bowling = build_bowling_summary(deliveries)
+    venue_summary = build_venue_summary(match_metrics)
+    toss_summary = build_toss_summary(match_metrics)
+    season_history = build_season_history(match_metrics, batting, bowling)
+
+    unique_players = pd.Index([])
+    if not deliveries.empty:
+        unique_players = pd.Index(deliveries["batter"].dropna().astype(str)).union(pd.Index(deliveries["bowler"].dropna().astype(str)))
+
+    overall_toss_win_rate = None
+    decisive_matches = match_metrics[match_metrics["decisive_match"]] if not match_metrics.empty else pd.DataFrame()
+    if not decisive_matches.empty:
+        overall_toss_win_rate = float(decisive_matches["toss_winner_won"].mean())
+
+    metrics = {
+        "matches": int(len(matches)),
+        "seasons": int(matches["season"].dropna().astype(str).nunique()) if not matches.empty else 0,
+        "teams": int(pd.concat([matches["team_1"], matches["team_2"]], ignore_index=True).dropna().astype(str).nunique()) if not matches.empty else 0,
+        "players": int(unique_players.nunique()) if not unique_players.empty else 0,
+        "tossWinRate": overall_toss_win_rate if overall_toss_win_rate is not None else 0.0,
+    }
+
+    return {
+        "metrics": metrics,
+        "teams": _frame_records(team_results.sort_values(["win_rate", "wins"], ascending=[False, False])) if not team_results.empty else [],
+        "teamSeason": _frame_records(team_results.sort_values(["season", "win_rate"], ascending=[True, False])) if not team_results.empty else [],
+        "batters": _frame_records(batting.sort_values(["runs", "strike_rate"], ascending=[False, False])) if not batting.empty else [],
+        "bowlers": _frame_records(bowling.sort_values(["wickets", "economy"], ascending=[False, True])) if not bowling.empty else [],
+        "toss": _frame_records(toss_summary.sort_values(["matches"], ascending=[False])) if not toss_summary.empty else [],
+        "tossSeason": _frame_records(toss_summary.sort_values(["season", "matches"], ascending=[True, False])) if not toss_summary.empty else [],
+        "venues": _frame_records(venue_summary.sort_values(["matches", "avg_first_innings_runs"], ascending=[False, False])) if not venue_summary.empty else [],
+        "issues": _frame_records(result.issues),
+        "seasons": season_history,
+    }
+
+
+def dashboard(
+    seasons: list[str] | None = None,
+    teams: list[str] | None = None,
+    venues: list[str] | None = None,
+) -> dict[str, Any]:
+    result = _filter_result(_load_result(), seasons=seasons, teams=teams, venues=venues)
+    return _aggregate_dashboard(result)
+
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+def root() -> FileResponse:
+    return FileResponse(BASE_DIR / "static" / "index.html")
 
 
 @app.get("/api/options")
-def options() -> dict[str, Any]:
-    result = _load()
-    m = result.matches
-    seasons = sorted(s for s in m["season"].dropna().astype(str).unique() if s)
-    teams   = sorted(t for t in pd.unique(m[["team_1","team_2"]].values.ravel("K")) if t)
-    venues  = sorted(m["venue"].dropna().astype(str).unique())
-    return {
-        "seasons": seasons,
-        "teams":   teams,
-        "venues":  venues,
-        "dataset": {
-            "matches":    len(result.matches),
-            "deliveries": len(result.deliveries),
-            "issues":     len(result.issues),
-        },
-    }
+def api_options() -> dict[str, list[str]]:
+    result = _load_result()
+    matches = result.matches
+    teams: list[str] = []
+    venues: list[str] = []
+    if not matches.empty:
+        teams = sorted(pd.concat([matches["team_1"], matches["team_2"]], ignore_index=True).dropna().astype(str).unique().tolist())
+        venues = sorted(matches["venue"].dropna().astype(str).unique().tolist())
+    return {"teams": teams, "venues": venues}
 
 
 @app.get("/api/dashboard")
-def dashboard(
+def api_dashboard(
     seasons: list[str] | None = Query(default=None),
-    teams:   list[str] | None = Query(default=None),
-    venues:  list[str] | None = Query(default=None),
+    teams: list[str] | None = Query(default=None),
+    venues: list[str] | None = Query(default=None),
 ) -> dict[str, Any]:
-    s = _split(seasons) or ["All"]
-    t = _split(teams)
-    v = _split(venues)
-    ctx = _ctx(s, t, v)
-    m   = ctx["matches"]
-    d   = ctx["deliveries"]
-    mm  = ctx["match_metrics"]
-    to  = _teams_overall(ctx["team_results"])
-    bat = _batting_overall(ctx["batting"])
-    bowl = _bowling_overall(ctx["bowling"])
-
-    bat  = bat[bat["balls"] >= 30].sort_values(["runs","strike_rate"], ascending=[False,False])
-    bowl = bowl[bowl["balls"] >= 30].sort_values(["wickets","economy"], ascending=[False,True])
-
-    st = ctx["team_results"].copy()
-    if not st.empty:
-        st["win_rate"] = st["wins"] / st["matches"].replace(0, pd.NA)
-
-    td = pd.DataFrame()
-    if not mm.empty:
-        td = (
-            mm.groupby("toss_decision", dropna=False, as_index=False)
-            .agg(matches=("match_id","count"), decisive_matches=("decisive_match","sum"),
-                 toss_winner_wins=("toss_winner_won","sum"))
-        )
-        td["win_rate"] = td["toss_winner_wins"] / td["decisive_matches"].replace(0, pd.NA)
-
-    players = 0
-    if not d.empty:
-        players = int(pd.unique(pd.concat([d["batter"],d["bowler"]], ignore_index=True)).size)
-
-    return {
-        "filters": {"seasons": s, "teams": t, "venues": v},
-        "metrics": {
-            "matches":     len(m),
-            "seasons":     int(m["season"].nunique()) if not m.empty else 0,
-            "teams":       int(pd.unique(m[["team_1","team_2"]].values.ravel("K")).size) if not m.empty else 0,
-            "players":     players,
-            "issues":      len(ctx["issues"]),
-            "tossWinRate": _safe_pct(mm["toss_winner_won"].sum(), mm["decisive_match"].sum()) if not mm.empty else 0,
-        },
-        "teams":      _records(to, 20),
-        "teamSeason": _records(st, 280),
-        "batters":    _records(bat, 30),
-        "bowlers":    _records(bowl, 30),
-        "toss":       _records(td, 10),
-        "tossSeason": _records(ctx["toss"], 120),
-        "venues":     _records(ctx["venues"].sort_values(["matches","avg_first_innings_runs"], ascending=False), 35),
-        "issues":     _records(ctx["issues"], 100),
-    }
+    return dashboard(seasons=seasons, teams=teams, venues=venues)
 
 
 @app.get("/api/records")
-def records_api() -> dict[str, Any]:
-    result = _load()
-    d = result.deliveries
-    m = result.matches
-    if d.empty or m.empty:
-        return {"topInnings": [], "topTotals": [], "topBowling": []}
-
-    # Top individual innings
-    bi = (
-        d.groupby(["match_id","batter"], as_index=False)
-        .agg(runs=("runs_batter","sum"), balls=("legal_delivery","sum"),
-             sixes=("runs_batter", lambda x: int((x == 6).sum())),
-             fours=("runs_batter", lambda x: int((x == 4).sum())))
-    )
-    bi["strike_rate"] = bi["runs"] / bi["balls"].replace(0, pd.NA) * 100
-    top_innings = (
-        bi.nlargest(10, "runs")
-        .merge(m[["match_id","date","venue","season","team_1","team_2"]], on="match_id", how="left")
-    )
-
-    # Highest team totals (1st innings)
-    t1 = (
-        d[d["innings"] == 1]
-        .groupby(["match_id","batting_team"], as_index=False)
-        .agg(total=("runs_total","sum"))
-    )
-    top_totals = (
-        t1.nlargest(10, "total")
-        .merge(m[["match_id","date","venue","season"]], on="match_id", how="left")
-    )
-
-    # Best bowling figures in a match
-    bm = (
-        d.groupby(["match_id","bowler"], as_index=False)
-        .agg(wickets=("bowler_wickets","sum"), runs=("bowler_runs_conceded","sum"),
-             balls=("legal_delivery","sum"))
-    )
-    bm["economy"] = bm["runs"] / (bm["balls"] / 6).replace(0, pd.NA)
-    top_bowling = (
-        bm.nlargest(10, "wickets")
-        .merge(m[["match_id","date","venue","season"]], on="match_id", how="left")
-    )
-
-    return {
-        "topInnings": _records(top_innings, 10),
-        "topTotals":  _records(top_totals,  10),
-        "topBowling": _records(top_bowling, 10),
-    }
+def api_records() -> dict[str, list[dict[str, Any]]]:
+    result = _load_result()
+    return build_records(result.matches, result.deliveries)
 
 
 @app.get("/api/seasons")
-def seasons_api() -> dict[str, Any]:
-    result = _load()
-    m = result.matches
-    d = result.deliveries
-    if m.empty:
-        return {"seasons": []}
-
-    sm = m.groupby("season", as_index=False).agg(matches=("match_id","count"))
-
-    if not d.empty:
-        sb = d.groupby(["season","batter"], as_index=False).agg(runs=("runs_batter","sum"))
-        tb = (
-            sb.loc[sb.groupby("season")["runs"].idxmax()]
-            .rename(columns={"batter":"top_scorer","runs":"top_scorer_runs"})
-        )
-        sw = d.groupby(["season","bowler"], as_index=False).agg(wickets=("bowler_wickets","sum"))
-        tw = (
-            sw.loc[sw.groupby("season")["wickets"].idxmax()]
-            .rename(columns={"bowler":"top_bowler","wickets":"top_bowler_wickets"})
-        )
-        sm = sm.merge(tb[["season","top_scorer","top_scorer_runs"]], on="season", how="left")
-        sm = sm.merge(tw[["season","top_bowler","top_bowler_wickets"]], on="season", how="left")
-
-    # Season avg first innings runs
-    mi = (
-        d[d["innings"] == 1]
-        .groupby(["season","match_id"], as_index=False)
-        .agg(inns_runs=("runs_total","sum"))
-        .groupby("season", as_index=False)
-        .agg(avg_runs=("inns_runs","mean"))
-    )
-    sm = sm.merge(mi, on="season", how="left")
-
-    return {"seasons": _records(sm.sort_values("season"))}
+def api_seasons() -> dict[str, list[dict[str, Any]]]:
+    result = _load_result()
+    summary = dashboard()["seasons"]
+    return {"seasons": summary}
 
 
 @app.post("/api/chat")
-def chat(payload: ChatRequest) -> dict[str, str]:
-    ctx = _ctx(payload.seasons or ["All"], payload.teams, payload.venues)
-    return {"answer": answer_question(payload.question, ctx)}
+async def api_chat(request: Request) -> JSONResponse:
+    payload = await request.json()
+    question = str(payload.get("question", "")).strip().lower()
+    data = dashboard(
+        seasons=payload.get("seasons"),
+        teams=payload.get("teams"),
+        venues=payload.get("venues"),
+    )
+
+    top_team = data["teams"][0]["team"] if data["teams"] else "the available teams"
+    top_batter = data["batters"][0]["batter"] if data["batters"] else "no batter data"
+    top_bowler = data["bowlers"][0]["bowler"] if data["bowlers"] else "no bowler data"
+
+    if "toss" in question:
+        answer = f"Toss winners won {data['metrics']['tossWinRate']:.1%} of decisive matches in the current view."
+    elif "bowler" in question or "wicket" in question:
+        answer = f"Top bowler in the current view: {top_bowler}."
+    elif "batter" in question or "run" in question or "score" in question:
+        answer = f"Top batter in the current view: {top_batter}."
+    elif "team" in question or "win" in question or "title" in question:
+        answer = f"Top team in the current view: {top_team}."
+    else:
+        answer = (
+            f"I can summarize the current IPL view: {data['metrics']['matches']} matches, "
+            f"{data['metrics']['seasons']} seasons, and {data['metrics']['players']} players."
+        )
+
+    return JSONResponse({"answer": answer})
