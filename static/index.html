@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IPL Analytics Dashboard — Match Lab</title>
+
+  <!-- Fonts: Bebas Neue (headings) · Rajdhani (stats) · Poppins (body) · Teko (labels) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Rajdhani:wght@500;600;700&family=Poppins:wght@300;400;500;600;700;800&family=Teko:wght@400;500;600;700&family=Inter:wght@400;500;700;800&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body data-theme="dark">
+
+<!-- ░░ LOADING OVERLAY ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ -->
+<div id="loadingOverlay" class="loading-overlay">
+  <div class="loader-cricket">
+    <div class="ball-spin"></div>
+    <p class="loader-text">Loading IPL Data…</p>
+    <p class="loader-sub">Crunching 1200+ matches 🏏</p>
+  </div>
+</div>
+
+<div class="app-shell">
+
+  <!-- ░░ SIDEBAR ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ -->
+  <aside class="sidebar">
+
+    <!-- Brand -->
+    <div class="brand-lockup">
+      <img src="https://upload.wikimedia.org/wikipedia/en/8/84/2021_IPL_Logo.png"
+           onerror="this.style.display='none';document.getElementById('brandFallback').style.display='grid'"
+           class="brand-ipl-logo" alt="IPL Logo" />
+      <div id="brandFallback" class="brand-mark" style="display:none">IPL</div>
+      <div>
+        <p class="eyebrow">Cricsheet Data</p>
+        <h1 class="brand-title">Match Lab</h1>
+        <p class="brand-sub">All Seasons · Full Dataset</p>
+      </div>
+    </div>
+
+    <!-- Navigation -->
+    <nav class="nav-list" aria-label="Main navigation">
+      <button class="nav-button active" data-page="home">🏠&nbsp; Home</button>
+      <button class="nav-button" data-page="teams">🏆&nbsp; Teams</button>
+      <button class="nav-button" data-page="players">⭐&nbsp; Players</button>
+      <button class="nav-button" data-page="toss">🪙&nbsp; Toss Analysis</button>
+      <button class="nav-button" data-page="venues">🏟️&nbsp; Venues</button>
+      <button class="nav-button" data-page="records">📈&nbsp; Records</button>
+      <button class="nav-button" data-page="seasons">📅&nbsp; Season History</button>
+      <button class="nav-button" data-page="quality">🔍&nbsp; Data Quality</button>
+      <button class="nav-button" data-page="chat">💬&nbsp; IPL Chatbot</button>
+    </nav>
+
+    <!-- Filters -->
+    <div class="filter-card">
+      <div class="filter-head">
+        <h2>🎛️ Filters</h2>
+        <button id="themeToggle" class="icon-button" type="button">☀️ Light</button>
+      </div>
+      <!-- Season filter intentionally removed: always shows full dataset -->
+      <label class="filter-label">
+        🏏 Filter by Teams
+        <select id="teamFilter" multiple size="5"></select>
+      </label>
+      <label class="filter-label">
+        🏟️ Filter by Venues
+        <select id="venueFilter" multiple size="4"></select>
+      </label>
+      <div class="filter-actions">
+        <button id="applyFilters" class="primary-button" type="button">Apply Filters</button>
+        <button id="resetFilters" class="secondary-button" type="button">Reset All</button>
+      </div>
+      <p class="tiny-note">💡 Hold Ctrl/⌘ to pick multiple. Leave empty = all included.</p>
+    </div>
+
+    <!-- Dataset info -->
+    <div class="sidebar-dataset">
+      <p class="eyebrow">📊 Dataset</p>
+      <p class="tiny-note">Full Cricsheet IPL Archive · All Seasons Combined · Live Stats</p>
+    </div>
+
+  </aside>
+
+  <!-- ░░ MAIN CONTENT ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ -->
+  <main class="main-content">
+
+    <!-- Scrolling stats ticker -->
+    <div class="stats-ticker-wrap">
+      <div id="statsTicker" class="ticker-container"></div>
+    </div>
+
+    <!-- ═══════════════════ HOME PAGE ═══════════════════════════════════════ -->
+    <section id="home" class="page active">
+
+      <!-- Hero banner -->
+      <div class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow pill">✨ India's Biggest Cricket Spectacle</p>
+          <h2 class="hero-headline">Where Records<br>Break Every Night.</h2>
+          <div class="hero-facts">
+            <span>⚡ World's No.1 T20 League</span>
+            <span>🌍 750M+ Fans Globally</span>
+            <span>💰 $10B+ Valuation</span>
+            <span>🏟️ 9 Epic Stadiums</span>
+            <span>🤝 600+ Players, 25+ Nations</span>
+          </div>
+          <p class="hero-desc">
+            10 powerhouse city franchises. 19 seasons of drama, records, and legends.
+            This dashboard turns every ball from the Cricsheet archive into a visual story —
+            clear enough for beginners, deep enough for analysts.
+          </p>
+          <div class="hero-actions">
+            <button class="primary-button jump-button" data-page="teams">🚀 Start Exploring</button>
+            <button class="secondary-button jump-button" data-page="chat">💬 Ask IPL Bot</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Metric cards -->
+      <div class="metric-grid stagger-children" id="metricGrid"></div>
+
+      <!-- Navigation tiles -->
+      <div class="image-strip stagger-children">
+        <button class="image-tile teams-tile jump-button" data-page="teams">
+          <div class="tile-inner"><span class="tile-icon">🏆</span><span class="tile-label">Team Form</span><span class="tile-sub">Win rates & rankings</span></div>
+        </button>
+        <button class="image-tile players-tile jump-button" data-page="players">
+          <div class="tile-inner"><span class="tile-icon">⭐</span><span class="tile-label">Player Stars</span><span class="tile-sub">Batters & bowlers</span></div>
+        </button>
+        <button class="image-tile toss-tile jump-button" data-page="toss">
+          <div class="tile-inner"><span class="tile-icon">🪙</span><span class="tile-label">Toss Impact</span><span class="tile-sub">Does the coin decide?</span></div>
+        </button>
+        <button class="image-tile venues-tile jump-button" data-page="venues">
+          <div class="tile-inner"><span class="tile-icon">🏟️</span><span class="tile-label">Venue Trends</span><span class="tile-sub">Ground characteristics</span></div>
+        </button>
+      </div>
+
+      <!-- Top team cards -->
+      <section class="panel reveal">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">🏆 Leaderboard</p>
+            <h3>Top Franchise Badges</h3>
+            <p class="tiny-note">Click any team card to see detailed stats</p>
+          </div>
+          <button class="secondary-button jump-button" data-page="teams">View All Teams →</button>
+        </div>
+        <div class="team-card-grid stagger-children" id="teamCards"></div>
+      </section>
+
+      <!-- How to read this dashboard (kid-friendly) -->
+      <section class="panel explainer-panel reveal">
+        <div class="explainer-header">
+          <span class="explainer-icon">🧒</span>
+          <div>
+            <h3>How to Read This Dashboard</h3>
+            <p class="tiny-note">Even if you've never watched cricket — you'll understand everything here!</p>
+          </div>
+        </div>
+        <div class="explainer-grid">
+          <div class="explainer-item">
+            <span class="ex-num">01</span>
+            <strong>Win Rate</strong>
+            <p>How often a team wins. 60% means they win 6 out of every 10 matches. Simple! 🎯</p>
+          </div>
+          <div class="explainer-item">
+            <span class="ex-num">02</span>
+            <strong>Strike Rate</strong>
+            <p>How fast a batter scores. SR of 150 means 150 runs per 100 balls faced. Higher = more aggressive! ⚡</p>
+          </div>
+          <div class="explainer-item">
+            <span class="ex-num">03</span>
+            <strong>Economy Rate</strong>
+            <p>Runs a bowler gives per over (6 balls). 7.5 economy = 7.5 runs per over. Lower = better bowler! 🎳</p>
+          </div>
+          <div class="explainer-item">
+            <span class="ex-num">04</span>
+            <strong>Toss Win Rate</strong>
+            <p>% of matches won by the team that won the coin toss. 50% = no edge, 60% = big advantage! 🪙</p>
+          </div>
+        </div>
+      </section>
+
+    </section>
+
+    <!-- ═══════════════════ TEAMS PAGE ══════════════════════════════════════ -->
+    <section id="teams" class="page">
+      <div class="page-nav-row">
+        <button class="back-button" data-page="home">← Back to Home</button>
+        <p class="page-crumb">Home → Teams</p>
+      </div>
+      <div class="page-banner teams-banner">
+        <div class="banner-inner">
+          <p class="eyebrow">🏆 Performance Analysis</p>
+          <h2>Team Performance</h2>
+          <p>Discover which franchises dominate the IPL. Each bar, each line — pure match data from the Cricsheet archive. Bigger bar = more wins!</p>
+        </div>
+      </div>
+
+      <div class="explain-card">
+        <span class="ec-icon">💡</span>
+        <div><strong>What is Win Rate?</strong> If a team plays 10 matches and wins 7 of them, their win rate is 70%! The chart below ranks all teams from best to least. Green bars = great teams! 🏆</div>
+      </div>
+
+      <div class="chart-grid two">
+        <article class="panel chart-panel">
+          <h3 class="chart-title">Overall Win Rate by Team</h3>
+          <div id="teamWinChart" class="chart"></div>
+        </article>
+        <article class="panel chart-panel">
+          <h3 class="chart-title">Win Rate Season by Season</h3>
+          <div id="teamSeasonChart" class="chart"></div>
+        </article>
+      </div>
+
+      <article class="panel">
+        <div class="section-title">
+          <h3>📋 Full Team Stats Table</h3>
+          <input class="table-search" id="teamSearch" type="search" placeholder="🔍 Search team…" />
+        </div>
+        <p class="tiny-note">🟢 Green = Win Rate ≥ 60% &nbsp;|&nbsp; 🔴 Red = Win Rate &lt; 38%</p>
+        <div class="table-wrap" id="teamTable"></div>
+      </article>
+    </section>
+
+    <!-- ═══════════════════ PLAYERS PAGE ════════════════════════════════════ -->
+    <section id="players" class="page">
+      <div class="page-nav-row">
+        <button class="back-button" data-page="home">← Back to Home</button>
+        <p class="page-crumb">Home → Players</p>
+      </div>
+      <div class="page-banner players-banner">
+        <div class="banner-inner">
+          <p class="eyebrow">⭐ Player Stats</p>
+          <h2>Player Stars</h2>
+          <p>Every run, every wicket — straight from ball-by-ball records. Only players with 30+ balls included for fair comparison.</p>
+        </div>
+      </div>
+
+      <div class="explain-card">
+        <span class="ec-icon">🏏</span>
+        <div><strong>Batting: The longer the bar, the more runs scored!</strong> The colour shows Strike Rate — brighter/warmer colours mean they score faster. Good batters have both: many runs AND fast scoring! ⚡</div>
+      </div>
+
+      <div class="chart-grid two">
+        <article class="panel chart-panel">
+          <h3 class="chart-title">Top Batters — Total Runs Scored</h3>
+          <div id="batterChart" class="chart"></div>
+        </article>
+        <article class="panel chart-panel">
+          <h3 class="chart-title">Top Bowlers — Total Wickets Taken</h3>
+          <div id="bowlerChart" class="chart"></div>
+        </article>
+      </div>
+
+      <div class="explain-card">
+        <span class="ec-icon">⚡</span>
+        <div><strong>Bowling: More wickets = better bowler!</strong> The colour shows Economy Rate — green means few runs given away per over (excellent!), red means expensive (many runs given). Best bowlers: lots of wickets + green colour! 🎯</div>
+      </div>
+
+      <div class="chart-grid two">
+        <article class="panel">
+          <div class="table-header">
+            <h3>🏏 Batting Leaderboard</h3>
+            <input class="table-search" id="batterSearch" type="search" placeholder="🔍 Search batter…" />
+          </div>
+          <div class="table-wrap" id="batterTable"></div>
+        </article>
+        <article class="panel">
+          <div class="table-header">
+            <h3>⚡ Bowling Leaderboard</h3>
+            <input class="table-search" id="bowlerSearch" type="search" placeholder="🔍 Search bowler…" />
+          </div>
+          <div class="table-wrap" id="bowlerTable"></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ TOSS PAGE ════════════════════════════════════════ -->
+    <section id="toss" class="page">
+      <div class="page-nav-row">
+        <button class="back-button" data-page="home">← Back to Home</button>
+        <p class="page-crumb">Home → Toss Analysis</p>
+      </div>
+      <div class="page-banner toss-banner">
+        <div class="banner-inner">
+          <p class="eyebrow">🪙 Toss Impact</p>
+          <h2>Does the Coin Decide?</h2>
+          <p>Analyzing how winning the toss affects match outcomes — and whether choosing to bat or field makes a difference.</p>
+        </div>
+      </div>
+
+      <div class="explain-card">
+        <span class="ec-icon">🪙</span>
+        <div>
+          <strong>What is a Toss?</strong>
+          <p>Before every IPL match, both captains meet in the middle. The umpire flips a coin — whoever calls it right gets to CHOOSE: bat first (try to set a big score) or field first (try to bowl the other team out cheaply). This is the TOSS! If bars are near 50%, the toss doesn't really matter. If a bar is much higher — the toss winner had a real advantage!</p>
+        </div>
+      </div>
+
+      <div class="chart-grid two">
+        <article class="panel chart-panel">
+          <h3 class="chart-title">Win Rate: Bat First vs Field First</h3>
+          <div id="tossDecisionChart" class="chart"></div>
+        </article>
+        <article class="panel chart-panel">
+          <h3 class="chart-title">Toss Edge Across All Seasons</h3>
+          <div id="tossSeasonChart" class="chart"></div>
+        </article>
+      </div>
+
+      <div class="explain-card blue">
+        <span class="ec-icon">🧠</span>
+        <div>
+          <strong>Key Insight to Remember:</strong>
+          <p>If the toss had ZERO effect, we'd expect exactly 50% win rate (pure luck). Anything significantly above 50% means the toss decision matters. In modern IPL, most teams prefer to FIELD first — because chasing a known target is psychologically easier than setting one! 🎯</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ VENUES PAGE ══════════════════════════════════════ -->
+    <section id="venues" class="page">
+      <div class="page-nav-row">
+        <button class="back-button" data-page="home">← Back to Home</button>
+        <p class="page-crumb">Home → Venues</p>
+      </div>
+      <div class="page-banner venue-banner">
+        <div class="banner-inner">
+          <p class="eyebrow">🏟️ Ground Analysis</p>
+          <h2>Venue Trends</h2>
+          <p>Every stadium has its own personality — some favour batters, some help bowlers. Find out which grounds are chasing heaven and which are bowler's paradise!</p>
+        </div>
+      </div>
+
+      <div class="explain-card">
+        <span class="ec-icon">🏟️</span>
+        <div>
+          <strong>How to Read the Scatter Plot:</strong>
+          <p>Each dot = one stadium. Dots to the RIGHT have higher first-innings scores (batter-friendly!). Dots at the TOP have high chasing win rates (teams batting 2nd win more often). Bigger dots = more matches played there. The colour shows how often teams batting first win — 🟢 green = defenders win more, 🔴 red = chasers win more!</p>
+        </div>
+      </div>
+
+      <div class="chart-grid two">
+        <article class="panel chart-panel">
+          <h3 class="chart-title">Venue Personality: Runs vs Chasing Success</h3>
+          <div id="venueScatter" class="chart"></div>
+        </article>
+        <article class="panel chart-panel">
+          <h3 class="chart-title">Average First Innings Runs by Venue</h3>
+          <div id="venueRunsChart" class="chart"></div>
+        </article>
+      </div>
+
+      <article class="panel">
+        <div class="section-title">
+          <h3>🏟️ Full Venue Table</h3>
+          <input class="table-search" id="venueSearch" type="search" placeholder="🔍 Search venue…" />
+        </div>
+        <div class="table-wrap" id="venueTable"></div>
+      </article>
+    </section>
+
+    <!-- ═══════════════════ RECORDS PAGE ═════════════════════════════════════ -->
+    <section id="records" class="page">
+      <div class="page-nav-row">
+        <button class="back-button" data-page="home">← Back to Home</button>
+        <p class="page-crumb">Home → Records</p>
+      </div>
+      <div class="page-banner records-banner">
+        <div class="banner-inner">
+          <p class="eyebrow">📈 Historic Records</p>
+          <h2>Records &amp; Milestones</h2>
+          <p>The biggest innings, the highest team totals, the most lethal bowling spells — all directly from the match files. Real data, real heroes!</p>
+        </div>
+      </div>
+
+      <div class="explain-card">
+        <span class="ec-icon">🏅</span>
+        <div><strong>These are REAL records from the Cricsheet dataset!</strong> Every row comes directly from the ball-by-ball match files — nothing is made up or estimated. Click any row to see match details! 🎯</div>
+      </div>
+
+      <div class="records-grid" id="recordsGrid">
+        <div class="records-loading">Loading records… ⏳</div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ SEASONS PAGE ═════════════════════════════════════ -->
+    <section id="seasons" class="page">
+      <div class="page-nav-row">
+        <button class="back-button" data-page="home">← Back to Home</button>
+        <p class="page-crumb">Home → Season History</p>
+      </div>
+      <div class="page-banner seasons-banner">
+        <div class="banner-inner">
+          <p class="eyebrow">📅 Season-by-Season</p>
+          <h2>IPL Season History</h2>
+          <p>From the inaugural 2008 season to the latest edition — explore how the IPL has grown, which stars dominated, and how each season told its own story.</p>
+        </div>
+      </div>
+
+      <div class="explain-card">
+        <span class="ec-icon">📅</span>
+        <div><strong>Each row is one complete IPL season.</strong> See who scored the most runs and took the most wickets in each year. The average first-innings score tells you how high-scoring that particular season was! 📊</div>
+      </div>
+
+      <div class="seasons-timeline" id="seasonsTimeline">
+        <div class="records-loading">Loading season history… ⏳</div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ DATA QUALITY PAGE ════════════════════════════════ -->
+    <section id="quality" class="page">
+      <div class="page-nav-row">
+        <button class="back-button" data-page="home">← Back to Home</button>
+        <p class="page-crumb">Home → Data Quality</p>
+      </div>
+      <div class="page-banner quality-banner">
+        <div class="banner-inner">
+          <p class="eyebrow">🔍 Pipeline Health</p>
+          <h2>Data Quality Report</h2>
+          <p>The parser handles imperfect data gracefully — broken records are logged, not silently corrupted. See exactly what was flagged during loading.</p>
+        </div>
+      </div>
+
+      <div class="explain-card green">
+        <span class="ec-icon">🛡️</span>
+        <div>
+          <strong>How the Fault-Tolerant Pipeline Works:</strong>
+          <p>Each of the 1,200+ JSON match files is parsed independently. If a file has missing sections, bad innings data, or non-numeric values — that specific part is logged below and skipped. The rest of the dataset loads perfectly. No single bad file can crash the whole dashboard! 🔒</p>
+        </div>
+      </div>
+
+      <article class="panel">
+        <div class="section-title">
+          <h3>🗒️ Parse Issue Log</h3>
+          <span id="issueCount" class="issue-badge">0 issues</span>
+        </div>
+        <div class="table-wrap" id="issueTable"></div>
+      </article>
+    </section>
+
+    <!-- ═══════════════════ CHATBOT PAGE ═════════════════════════════════════ -->
+    <section id="chat" class="page">
+      <div class="page-nav-row">
+        <button class="back-button" data-page="home">← Back to Home</button>
+        <p class="page-crumb">Home → IPL Chatbot</p>
+      </div>
+      <div class="page-banner chat-banner">
+        <div class="banner-inner">
+          <p class="eyebrow">💬 IPL Knowledge Bot</p>
+          <h2>Ask the IPL Bot</h2>
+          <p>Your personal IPL expert! Ask about history, player stats, team records, cricket rules, famous moments — anything about the IPL!</p>
+        </div>
+      </div>
+
+      <div class="explain-card purple">
+        <span class="ec-icon">🤖</span>
+        <div><strong>How the Chatbot Works:</strong> It combines IPL historical knowledge with LIVE statistics from the current dataset (affected by your filters). Ask about teams, players, rules, history, records — it knows a lot! Try the suggestion buttons below to get started. 👇</div>
+      </div>
+
+      <article class="panel chat-panel">
+        <h3 class="chat-panel-title">💬 Suggested Questions</h3>
+        <div class="suggestions" id="suggestions"></div>
+
+        <div class="chat-box" id="chatBox"></div>
+
+        <div class="chat-input-row">
+          <input id="chatInput" type="text" placeholder="Ask: What is T20 cricket? Who wins the most?" autocomplete="off" />
+          <button id="sendChat" class="primary-button" type="button">Send 📨</button>
+        </div>
+      </article>
+    </section>
+
+  </main>
+</div>
+
+<script src="/static/app.js" type="module"></script>
+</body>
+</html>

@@ -17,6 +17,18 @@ CRICHEET_BOWLER_CREDIT_WICKETS = {
     "hit wicket",
 }
 
+BATTER_DISMISSAL_KINDS = {
+    "bowled",
+    "caught",
+    "caught and bowled",
+    "hit wicket",
+    "lbw",
+    "obstructing the field",
+    "retired out",
+    "run out",
+    "stumped",
+}
+
 
 @dataclass
 class ParseIssue:
@@ -44,6 +56,20 @@ def _first_value(value: Any) -> Any:
     if isinstance(value, list):
         return value[0] if value else None
     return value
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_float(value: Any, source: str, issues: list[ParseIssue], field: str) -> float:
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        issues.append(ParseIssue(source, "warning", f"Non-numeric value for {field}: {value!r}; using 0."))
+        return 0.0
 
 
 def _safe_json_load(raw: str, source: str, issues: list[ParseIssue]) -> dict[str, Any] | None:
@@ -91,14 +117,14 @@ def _is_legal_delivery(delivery: dict[str, Any]) -> bool:
     return not extras.get("wides") and not extras.get("noballs")
 
 
-def _bowler_runs_conceded(delivery: dict[str, Any]) -> float:
-    runs = delivery.get("runs") or {}
-    extras = delivery.get("extras") or {}
-    if not isinstance(runs, dict):
-        return 0.0
-    if not isinstance(extras, dict):
-        extras = {}
-    return float(runs.get("total", 0)) - float(extras.get("byes", 0)) - float(extras.get("legbyes", 0))
+def _bowler_runs_conceded(delivery: dict[str, Any], source: str, issues: list[ParseIssue]) -> float:
+    runs = _as_dict(delivery.get("runs"))
+    extras = _as_dict(delivery.get("extras"))
+    return (
+        _safe_float(runs.get("total", 0), source, issues, "runs.total")
+        - _safe_float(extras.get("byes", 0), source, issues, "extras.byes")
+        - _safe_float(extras.get("legbyes", 0), source, issues, "extras.legbyes")
+    )
 
 
 def load_cricsheet_archive(source_path: str | Path) -> PipelineResult:
@@ -125,8 +151,8 @@ def load_cricsheet_archive(source_path: str | Path) -> PipelineResult:
             issues.append(ParseIssue(source_name, "warning", "Skipping match with fewer than two teams."))
             continue
 
-        outcome = info.get("outcome") or {}
-        toss = info.get("toss") or {}
+        outcome = _as_dict(info.get("outcome"))
+        toss = _as_dict(info.get("toss"))
         season = _as_text(_first_value(info.get("season")))
         venue = _as_text(info.get("venue"))
         city = _as_text(info.get("city"))
@@ -219,15 +245,15 @@ def load_cricsheet_archive(source_path: str | Path) -> PipelineResult:
                             "batter": batter,
                             "bowler": bowler,
                             "non_striker": non_striker,
-                            "runs_batter": float(runs.get("batter", 0)),
-                            "runs_extras": float(runs.get("extras", 0)),
-                            "runs_total": float(runs.get("total", 0)),
+                            "runs_batter": _safe_float(runs.get("batter", 0), source_name, issues, "runs.batter"),
+                            "runs_extras": _safe_float(runs.get("extras", 0), source_name, issues, "runs.extras"),
+                            "runs_total": _safe_float(runs.get("total", 0), source_name, issues, "runs.total"),
                             "legal_delivery": legal_delivery,
                             "wicket_count": wicket_count,
                             "dismissal_kinds": "; ".join(kind for kind in dismissal_kinds if kind),
                             "dismissed_players": "; ".join(player for player in dismissed_players if player),
                             "bowler_wickets": bowler_wickets,
-                            "bowler_runs_conceded": _bowler_runs_conceded(delivery),
+                            "bowler_runs_conceded": _bowler_runs_conceded(delivery, source_name, issues),
                         }
                     )
 
@@ -251,24 +277,32 @@ def build_team_results(matches_df: pd.DataFrame) -> pd.DataFrame:
 
     rows: list[dict[str, Any]] = []
     for _, match in matches_df.iterrows():
+        has_winner = bool(match["winner"])
         for team in (match["team_1"], match["team_2"]):
             rows.append(
                 {
                     "season": match["season"],
                     "team": team,
                     "match_id": match["match_id"],
-                    "won": bool(match["winner"] and team == match["winner"]),
-                    "lost": bool(match["winner"] and team != match["winner"]),
-                    "tied_or_no_result": not bool(match["winner"]),
+                    "decisive_match": has_winner,
+                    "won": bool(has_winner and team == match["winner"]),
+                    "lost": bool(has_winner and team != match["winner"]),
+                    "tied_or_no_result": not has_winner,
                 }
             )
     team_matches = pd.DataFrame(rows)
     summary = (
         team_matches.groupby(["season", "team"], dropna=False)
-        .agg(matches=("match_id", "count"), wins=("won", "sum"))
+        .agg(
+            matches=("match_id", "count"),
+            decisive_matches=("decisive_match", "sum"),
+            wins=("won", "sum"),
+            losses=("lost", "sum"),
+            tied_or_no_results=("tied_or_no_result", "sum"),
+        )
         .reset_index()
     )
-    summary["win_rate"] = summary["wins"] / summary["matches"]
+    summary["win_rate"] = summary["wins"] / summary["decisive_matches"].replace(0, pd.NA)
     return summary
 
 
@@ -279,9 +313,27 @@ def build_batting_summary(deliveries_df: pd.DataFrame) -> pd.DataFrame:
     batting = deliveries_df.copy()
     batting["is_boundary_four"] = batting["runs_batter"] == 4
     batting["is_boundary_six"] = batting["runs_batter"] == 6
-    batting["dismissed_batter"] = batting.apply(
-        lambda row: row["batter"] in {player.strip() for player in str(row["dismissed_players"]).split(";") if player.strip()},
-        axis=1,
+
+    # Build dismissal counts without per-row lambdas for faster large-season processing.
+    dismissed = (
+        batting.loc[:, ["season", "dismissed_players", "dismissal_kinds"]]
+        .assign(
+            dismissed_player=lambda df: df["dismissed_players"].fillna("").astype(str).str.split(";"),
+            dismissal_kind=lambda df: df["dismissal_kinds"].fillna("").astype(str).str.split(";"),
+        )
+        .explode(["dismissed_player", "dismissal_kind"])
+    )
+    dismissed["dismissed_player"] = dismissed["dismissed_player"].astype(str).str.strip()
+    dismissed["dismissal_kind"] = dismissed["dismissal_kind"].astype(str).str.strip()
+    dismissed = dismissed[
+        (dismissed["dismissed_player"] != "")
+        & (dismissed["dismissal_kind"].isin(BATTER_DISMISSAL_KINDS))
+    ]
+    dismissals = (
+        dismissed.groupby(["season", "dismissed_player"], dropna=False)
+        .size()
+        .reset_index(name="dismissals")
+        .rename(columns={"dismissed_player": "batter"})
     )
 
     summary = (
@@ -291,10 +343,11 @@ def build_batting_summary(deliveries_df: pd.DataFrame) -> pd.DataFrame:
             balls=("legal_delivery", "sum"),
             fours=("is_boundary_four", "sum"),
             sixes=("is_boundary_six", "sum"),
-            dismissals=("dismissed_batter", "sum"),
         )
         .reset_index()
     )
+    summary = summary.merge(dismissals, on=["season", "batter"], how="left")
+    summary["dismissals"] = summary["dismissals"].fillna(0)
     summary["strike_rate"] = summary["runs"] / summary["balls"].replace(0, pd.NA) * 100
     summary["average"] = summary["runs"] / summary["dismissals"].replace(0, pd.NA)
     summary["boundary_runs"] = summary["fours"] * 4 + summary["sixes"] * 6
@@ -331,9 +384,10 @@ def build_match_metrics(matches_df: pd.DataFrame, deliveries_df: pd.DataFrame) -
         first_innings_batting_team=("batting_team", "first"),
     )
     merged = matches_df.merge(first_innings, on="match_id", how="left")
-    merged["toss_winner_won"] = merged["winner"].eq(merged["toss_winner"])
-    merged["batting_first_won"] = merged["winner"].eq(merged["first_innings_batting_team"])
-    merged["chasing_won"] = merged["winner"].ne(merged["first_innings_batting_team"])
+    merged["decisive_match"] = merged["winner"].astype(str).str.len() > 0
+    merged["toss_winner_won"] = merged["decisive_match"] & merged["winner"].eq(merged["toss_winner"])
+    merged["batting_first_won"] = merged["decisive_match"] & merged["winner"].eq(merged["first_innings_batting_team"])
+    merged["chasing_won"] = merged["decisive_match"] & merged["winner"].ne(merged["first_innings_batting_team"])
     merged["result_label"] = merged["winner"].where(merged["winner"].astype(bool), merged["result"])
     return merged
 
@@ -346,6 +400,7 @@ def build_venue_summary(match_metrics_df: pd.DataFrame) -> pd.DataFrame:
         match_metrics_df.groupby("venue", dropna=False)
         .agg(
             matches=("match_id", "count"),
+            decisive_matches=("decisive_match", "sum"),
             avg_first_innings_runs=("first_innings_runs", "mean"),
             batting_first_wins=("batting_first_won", "sum"),
             chasing_wins=("chasing_won", "sum"),
@@ -353,9 +408,10 @@ def build_venue_summary(match_metrics_df: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
-    summary["batting_first_win_rate"] = summary["batting_first_wins"] / summary["matches"]
-    summary["chasing_win_rate"] = summary["chasing_wins"] / summary["matches"]
-    summary["toss_winner_win_rate"] = summary["toss_winner_wins"] / summary["matches"]
+    denominator = summary["decisive_matches"].replace(0, pd.NA)
+    summary["batting_first_win_rate"] = summary["batting_first_wins"] / denominator
+    summary["chasing_win_rate"] = summary["chasing_wins"] / denominator
+    summary["toss_winner_win_rate"] = summary["toss_winner_wins"] / denominator
     return summary.sort_values(["matches", "avg_first_innings_runs"], ascending=[False, False])
 
 
@@ -365,8 +421,12 @@ def build_toss_summary(match_metrics_df: pd.DataFrame) -> pd.DataFrame:
 
     summary = (
         match_metrics_df.groupby(["season", "toss_decision"], dropna=False)
-        .agg(matches=("match_id", "count"), toss_winner_wins=("toss_winner_won", "sum"))
+        .agg(
+            matches=("match_id", "count"),
+            decisive_matches=("decisive_match", "sum"),
+            toss_winner_wins=("toss_winner_won", "sum"),
+        )
         .reset_index()
     )
-    summary["toss_winner_win_rate"] = summary["toss_winner_wins"] / summary["matches"]
+    summary["toss_winner_win_rate"] = summary["toss_winner_wins"] / summary["decisive_matches"].replace(0, pd.NA)
     return summary
