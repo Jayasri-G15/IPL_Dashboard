@@ -196,7 +196,7 @@ async function init() {
   setOptions($("#venueFilter"), opts.venues, []);
   wireEvents();
   renderSuggestions();
-  await loadDashboard();
+  await loadDashboard({ showOverlay: true });
 }
 
 // ─── Events ───────────────────────────────────────────────────────────────────
@@ -255,13 +255,13 @@ function showPage(page) {
 }
 
 // ─── Load dashboard data ──────────────────────────────────────────────────────
-async function loadDashboard() {
+async function loadDashboard({ showOverlay = false } = {}) {
   const p = new URLSearchParams();
   state.filters.teams.forEach(v => p.append("teams", v));
   state.filters.venues.forEach(v => p.append("venues", v));
 
   const overlay = $("#loadingOverlay");
-  if (overlay) overlay.style.display = "flex";
+  if (overlay) overlay.style.display = showOverlay ? "flex" : "none";
 
   state.data = await fetch(`/api/dashboard?${p}`).then(r => r.json());
 
