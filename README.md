@@ -67,6 +67,32 @@ uvicorn app:app --host 0.0.0.0 --port $PORT
 
 The included `Procfile` works for hosts that support Procfile-based Python web apps.
 
+### Vercel — Python builder (no Docker)
+
+You can deploy to Vercel without Docker using the Python builder. This repo now includes `vercel.json` configured to use `@vercel/python` and routes all requests to `app.py` which exports an ASGI `app = FastAPI(...)` instance.
+
+Steps:
+
+1. Push the repository to GitHub.
+2. In the Vercel dashboard, import the GitHub repo and create a new project.
+3. Vercel will detect `vercel.json` and build using the Python builder.
+
+Or deploy via CLI:
+
+```bash
+# install Vercel CLI if needed
+npm i -g vercel
+vercel login
+
+# interactive deploy
+vercel --prod
+```
+
+Important notes:
+- `app.py` exposes the ASGI `app` object which Vercel's Python builder will use directly.
+- Static assets are served by the FastAPI mount at `/static` (the `static/` folder is included in the repo). Vercel will route requests to `app.py`, which serves static files via Starlette's `StaticFiles`.
+- Ensure `ipl_json.zip` is part of the repository, or update `DEFAULT_SOURCE` in `app.py` to point to an external data URL or mounted storage if you want smaller deployments.
+
 ## Files
 
 - `app.py` - FastAPI app, API endpoints, and static dashboard serving.
