@@ -14,7 +14,7 @@ Custom deployable IPL analytics web app built with FastAPI, vanilla HTML/CSS/Jav
 
 ```bash
 pip install -r requirements.txt
-uvicorn app:app --reload
+uvicorn vercel_app:app --reload
 ```
 
 Open:
@@ -48,28 +48,9 @@ lucknow-super-giants.png
 
 If a logo file is missing, the dashboard shows a polished fallback badge.
 
-## Deploy
-
-### Render
-
-This repo includes `render.yaml`.
-
-1. Push the project to GitHub.
-2. Create a new Render Blueprint or Web Service.
-3. Render will use:
-
-```bash
-pip install -r requirements.txt
-uvicorn app:app --host 0.0.0.0 --port $PORT
-```
-
-### Other Python Hosts
-
-The included `Procfile` works for hosts that support Procfile-based Python web apps.
-
 ### Vercel — Python builder (no Docker)
 
-You can deploy to Vercel without Docker using the Python builder. This repo now includes `vercel.json` configured to use `@vercel/python` and routes all requests to `app.py` which exports an ASGI `app = FastAPI(...)` instance.
+You can deploy to Vercel without Docker using the Python builder. This repo now includes `vercel.json` configured to use `@vercel/python` and routes requests to `vercel_app.py`, which serves the static homepage and JSON API used by the browser UI.
 
 Steps:
 
@@ -89,13 +70,13 @@ vercel --prod
 ```
 
 Important notes:
-- `app.py` exposes the ASGI `app` object which Vercel's Python builder will use directly.
-- Static assets are served by the FastAPI mount at `/static` (the `static/` folder is included in the repo). Vercel will route requests to `app.py`, which serves static files via Starlette's `StaticFiles`.
-- Ensure `ipl_json.zip` is part of the repository, or update `DEFAULT_SOURCE` in `app.py` to point to an external data URL or mounted storage if you want smaller deployments.
+- `vercel_app.py` exposes the ASGI `app` object which Vercel's Python builder will use directly.
+- Static assets are served by the FastAPI mount at `/static` (the `static/` folder is included in the repo). Vercel will route requests to `vercel_app.py`, which serves static files via Starlette's `StaticFiles`.
+- Ensure `ipl_json.zip` is part of the repository, or update `DATASET_PATH` in `vercel_app.py` to point to an external data URL or mounted storage if you want smaller deployments.
 
 ## Files
 
-- `app.py` - FastAPI app, API endpoints, and static dashboard serving.
+- `vercel_app.py` - Vercel FastAPI app, API endpoints, and static homepage serving.
 - `pipeline.py` - Cricsheet parser and analytics pipeline.
 - `static/index.html` - dashboard HTML shell.
 - `static/styles.css` - custom UI styling.
