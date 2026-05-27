@@ -5,6 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
+import plotly
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -24,6 +25,7 @@ from pipeline import (
 ROOT_DIR = Path(__file__).resolve().parent
 STATIC_DIR = ROOT_DIR / "static"
 DATASET_PATH = ROOT_DIR / "ipl_json.zip"
+PLOTLY_BUNDLE = Path(plotly.__file__).resolve().parent / "package_data" / "plotly.min.js"
 
 
 app = FastAPI(title="IPL Analytics Dashboard")
@@ -315,6 +317,11 @@ def options() -> dict[str, list[str]]:
         "teams": _available_teams(result.matches),
         "venues": _available_venues(result.matches),
     }
+
+
+@app.get("/plotly.min.js", include_in_schema=False)
+def plotly_bundle() -> FileResponse:
+    return FileResponse(PLOTLY_BUNDLE, media_type="application/javascript")
 
 
 @app.get("/api/dashboard")
