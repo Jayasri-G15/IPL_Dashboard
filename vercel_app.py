@@ -117,19 +117,32 @@ TEAM_ABBREVIATIONS = {
 
 PLAYER_ALIASES = {
     "virat kohli": "V Kohli",
+    "kohli": "V Kohli",
     "rohit sharma": "RG Sharma",
+    "rohit": "RG Sharma",
     "ms dhoni": "MS Dhoni",
+    "dhoni": "MS Dhoni",
     "mahendra singh dhoni": "MS Dhoni",
     "chris gayle": "CH Gayle",
+    "gayle": "CH Gayle",
     "ab de villiers": "AB de Villiers",
+    "abd": "AB de Villiers",
     "suresh raina": "SK Raina",
+    "raina": "SK Raina",
     "shikhar dhawan": "S Dhawan",
+    "dhawan": "S Dhawan",
     "david warner": "DA Warner",
+    "warner": "DA Warner",
     "kl rahul": "KL Rahul",
+    "rahul": "KL Rahul",
     "ravindra jadeja": "RA Jadeja",
+    "jadeja": "RA Jadeja",
     "jasprit bumrah": "JJ Bumrah",
+    "bumrah": "JJ Bumrah",
     "hardik pandya": "HH Pandya",
+    "pandya": "HH Pandya",
     "kieron pollard": "KA Pollard",
+    "pollard": "KA Pollard",
 }
 
 
@@ -165,41 +178,35 @@ def _name_tokens(name: str) -> list[str]:
     return [token for token in _normalize_text(name).split() if len(token) > 2]
 
 
-def _best_name_match(question: str, candidates: list[str]) -> str | None:
-    normalized_question = _normalize_text(question)
+def _match_explicit_name(question: str, candidates: list[str], aliases: dict[str, str]) -> str | None:
+    normalized_question = f" {_normalize_text(question)} "
     if not candidates:
         return None
 
-    for alias, canonical in PLAYER_ALIASES.items():
-        if re.search(rf"\b{re.escape(alias)}\b", normalized_question) and canonical in candidates:
+    for alias, canonical in aliases.items():
+        if f" {alias} " in normalized_question and canonical in candidates:
             return canonical
 
-    for alias, canonical in TEAM_ABBREVIATIONS.items():
-        if re.search(rf"\b{re.escape(alias)}\b", normalized_question) and canonical in candidates:
-            return canonical
-
-    exact_matches = [candidate for candidate in candidates if _normalize_text(candidate) in normalized_question]
+    exact_matches = [candidate for candidate in candidates if f" {_normalize_text(candidate)} " in normalized_question]
     if exact_matches:
-        return sorted(exact_matches, key=len)[0]
+        return sorted(exact_matches, key=len, reverse=True)[0]
 
-    scored: list[tuple[int, str]] = []
+    return None
+
+
+def _match_player(question: str, candidates: list[str]) -> str | None:
+    return _match_explicit_name(question, candidates, PLAYER_ALIASES)
+
+
+def _match_team(question: str, candidates: list[str]) -> str | None:
+    return _match_explicit_name(question, candidates, TEAM_ABBREVIATIONS)
+
+
+def _match_venue(question: str, candidates: list[str]) -> str | None:
+    normalized_question = f" {_normalize_text(question)} "
     for candidate in candidates:
-        score = 0
-        candidate_text = _normalize_text(candidate)
-        tokens = _name_tokens(candidate)
-        for token in tokens:
-            if token in normalized_question:
-                score += 3
-        for token in tokens:
-            if token in candidate_text:
-                score += 1
-        if score:
-            scored.append((score, candidate))
-
-    if scored:
-        scored.sort(key=lambda item: (-item[0], len(item[1])))
-        best_score, best_candidate = scored[0]
-        return best_candidate if best_score >= 3 else None
+        if f" {_normalize_text(candidate)} " in normalized_question:
+            return candidate
     return None
 
 
@@ -371,15 +378,25 @@ def _answer_knowledge_question(question: str, matches: pd.DataFrame, deliveries:
     all_players = sorted(pd.unique(pd.concat([deliveries["batter"], deliveries["bowler"]], ignore_index=True).dropna().astype(str)).tolist()) if not deliveries.empty else []
     all_venues = _available_venues(matches)
 
-    player = _best_name_match(question, all_players)
-    if player:
-        return _player_profile(player, deliveries)
+    if any(keyword in normalized_question for keyword in ["team", "franchise", "squad", "club"]):
+        team = _match_team(question, all_teams)
+        if team:
+            return _team_profile(team, matches, deliveries)
 
-    team = _best_name_match(question, all_teams)
+    if any(keyword in normalized_question for keyword in ["player", "batter", "bowler", "batting", "bowling", "cricketer"]):
+        player = _match_player(question, all_players)
+        if player:
+            return _player_profile(player, deliveries)
+
+    team = _match_team(question, all_teams)
     if team:
         return _team_profile(team, matches, deliveries)
 
-    venue = _best_name_match(question, all_venues)
+    player = _match_player(question, all_players)
+    if player:
+        return _player_profile(player, deliveries)
+
+    venue = _match_venue(question, all_venues)
     if venue:
         return _venue_profile(venue, match_metrics)
 
