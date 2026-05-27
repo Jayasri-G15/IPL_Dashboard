@@ -438,6 +438,7 @@ def build_toss_summary(match_metrics_df: pd.DataFrame) -> pd.DataFrame:
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_SOURCE = BASE_DIR / "ipl_json.zip"
+DATA_PATH = BASE_DIR / "ipl_json.zip"
 
 app = FastAPI(title="IPL Analytics Dashboard")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -451,6 +452,11 @@ def _source_path() -> Path:
 
 @lru_cache(maxsize=1)
 def _load_result() -> PipelineResult:
+    # If we preloaded a pipeline_result at import time, prefer that
+    pre = globals().get("pipeline_result")
+    if pre is not None:
+        return pre
+
     source = _source_path()
     try:
         return load_cricsheet_archive(source)
@@ -471,6 +477,14 @@ def _normalize_values(values: list[str] | None) -> list[str]:
     if not values:
         return []
     return [value for value in values if value and value != "All"]
+
+
+# Attempt to preload the pipeline at import time if the data file exists.
+# This creates `pipeline_result` in module globals so other callers can reuse it.
+try:
+    pipeline_result = load_cricsheet_archive(DATA_PATH)
+except Exception:
+    pipeline_result = None
 
 
 def _filter_result(
